@@ -3,3 +3,5 @@ uvicorn
 yfinance
 pandas
 supabase
+scikit-learn
+numpy
