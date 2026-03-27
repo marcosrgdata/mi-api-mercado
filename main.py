@@ -6,6 +6,8 @@ from sklearn.linear_model import LinearRegression
 import numpy as np
 import os
 import datetime
+import threading
+import time
 
 app = FastAPI()
 
@@ -17,9 +19,48 @@ try:
 except:
     supabase = None
 
+# --- TRABAJADOR AUTOMÁTICO (EL "GRIFO" QUE NO PARA) ---
+def background_worker():
+    """Esta función corre para siempre en segundo plano cada 15 minutos."""
+    print("Iniciando trabajador automático...")
+    tickets = {
+        "Gold": "GC=F", "Oil": "CL=F", "Copper": "HG=F", 
+        "Silver": "SI=F", "Natural_Gas": "NG=F", 
+        "Lithium": "LIT", "Uranium": "URA" 
+    }
+    
+    while True:
+        print(f"[{datetime.datetime.now()}] Recolectando datos automáticos...")
+        for name, ticker_id in tickets.items():
+            try:
+                ticker = yf.Ticker(ticker_id)
+                hist = ticker.history(period="2d")
+                if len(hist) < 1: continue
+                
+                price = round(hist['Close'].iloc[-1], 2)
+                trend = "BULLISH" if price > hist['Close'].mean() else "BEARISH"
+                
+                if supabase:
+                    try:
+                        supabase.table("precios_historicos").insert({
+                            "activo": name, 
+                            "precio": price, 
+                            "tendencia": trend
+                        }).execute()
+                    except: pass
+            except: continue
+        
+        # --- EL FRENO DE MANO ---
+        print("Datos guardados. Durmiendo 15 minutos (900 seg)...")
+        time.sleep(900)  # 900 segundos = 15 minutos
+
+# --- INICIAR EL TRABAJADOR AL ARRANCAR ---
+# Esto lanza el bucle en un hilo separado para que no bloquee la API
+threading.Thread(target=background_worker, daemon=True).start()
+
+
 # --- AI ENGINE ---
 def calculate_forecast(prices_list):
-    """Calculates a 24h prediction using Linear Regression."""
     y = np.array(prices_list)
     X = np.arange(len(y)).reshape(-1, 1)
     model = LinearRegression()
@@ -37,7 +78,7 @@ def home():
 
 @app.get("/market-intelligence")
 def get_market_intelligence():
-    """Returns current prices and saves to DB."""
+    """Este endpoint sigue funcionando igual para tus clientes."""
     tickets = {
         "Gold": "GC=F", "Oil": "CL=F", "Copper": "HG=F", 
         "Silver": "SI=F", "Natural_Gas": "NG=F", 
@@ -48,30 +89,19 @@ def get_market_intelligence():
         try:
             ticker = yf.Ticker(ticker_id)
             hist = ticker.history(period="7d")
-            if len(hist) < 2: continue
-            
             price = round(hist['Close'].iloc[-1], 2)
             trend = "BULLISH" if price > hist['Close'].mean() else "BEARISH"
-            
-            if supabase:
-                try:
-                    supabase.table("precios_historicos").insert({"activo": name, "precio": price, "tendencia": trend}).execute()
-                except: pass
-
             analysis[name] = {"price": price, "trend": trend, "risk": "HIGH" if (hist['Close'].std()/price) > 0.02 else "LOW"}
         except: continue
     return analysis
 
 @app.get("/historical-stats")
 def get_historical_stats(asset: str = "Gold"):
-    """Returns stats from the database for a specific asset."""
     if not supabase: return {"error": "DB not connected"}
     try:
         response = supabase.table("precios_historicos").select("precio").eq("activo", asset).order("id", desc=True).limit(20).execute()
         prices = [row['precio'] for row in response.data]
-        if len(prices) < 2:
-            return {"message": f"Collecting data for {asset}. Try again later."}
-        
+        if len(prices) < 2: return {"message": f"Collecting data for {asset}."}
         return {
             "asset": asset,
             "average_price": round(sum(prices)/len(prices), 2),
@@ -79,19 +109,16 @@ def get_historical_stats(asset: str = "Gold"):
             "min": min(prices),
             "volatility": round(pd.Series(prices).std(), 4)
         }
-    except Exception as e:
-        return {"error": str(e)}
+    except Exception as e: return {"error": str(e)}
 
 @app.get("/premium-forecast")
 def get_premium_forecast(asset: str = "Gold"):
-    """ULTRA ENDPOINT: AI Prediction for the next 24h."""
     if not supabase: return {"error": "DB not connected"}
     try:
         response = supabase.table("precios_historicos").select("precio").eq("activo", asset).order("id", desc=True).limit(30).execute()
         prices = [row['precio'] for row in response.data]
         prices.reverse()
-        if len(prices) < 15:
-            return {"message": f"Need more data for {asset} (Current: {len(prices)}/15)"}
+        if len(prices) < 15: return {"message": f"Need more data (Current: {len(prices)}/15)"}
         prediction, r2 = calculate_forecast(prices)
         current = prices[-1]
         return {
@@ -101,5 +128,4 @@ def get_premium_forecast(asset: str = "Gold"):
             "confidence_r2": r2,
             "expected_move": "UPWARD" if prediction > current else "DOWNWARD"
         }
-    except Exception as e:
-        return {"error": str(e)}
+    except Exception as e: return {"error": str(e)}
