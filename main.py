@@ -45,7 +45,6 @@ ALL_TICKERS = {k: v for cat in CATEGORIZED_TICKERS.values() for k, v in cat.item
 
 # --- QUANT ENGINE ---
 def calculate_rsi(prices, period=14):
-    """Calculates the RSI for a given series of prices."""
     if len(prices) < period: return 50
     delta = prices.diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
@@ -56,7 +55,6 @@ def calculate_rsi(prices, period=14):
 
 # --- BACKGROUND WORKER ---
 def background_worker():
-    """Background task to store historical data points."""
     while True:
         for name, ticker_id in ALL_TICKERS.items():
             try:
@@ -92,7 +90,6 @@ def get_dashboard():
         for sector, assets in CATEGORIZED_TICKERS.items():
             for name, tid in assets.items():
                 try:
-                    # Robust data extraction from MultiIndex DataFrame
                     if len(ticker_ids) > 1:
                         hist = raw_data[tid].dropna()
                     else:
@@ -144,9 +141,13 @@ def get_dashboard():
         fig.update_layout(
             template="plotly_dark", height=850, margin=dict(t=180, b=50, l=60, r=60),
             paper_bgcolor="#0a0a0a", plot_bgcolor="#0a0a0a",
-            title_text="GLOBAL QUANT TERMINAL V3.10", title_x=0.5, title_y=0.98,
+            title_text="GLOBAL QUANT TERMINAL V3.11", title_x=0.5, title_y=0.98,
             hovermode="x unified",
-            legend=dict(itemclick="toggle", itemdoubleclick="isolate", font=dict(size=10), orientation="v", x=1.02, y=0.5),
+            legend=dict(
+                itemclick="toggle", 
+                itemdoubleclick="toggleothers", # FIX: Changed from 'isolate' to 'toggleothers'
+                font=dict(size=10), orientation="v", x=1.02, y=0.5
+            ),
             updatemenus=[dict(
                 type="buttons", direction="right", x=0.5, y=1.22, xanchor="center",
                 buttons=buttons, bgcolor="#111827", font=dict(color="#ffffff", size=11), bordercolor="#374151"
@@ -190,4 +191,4 @@ def get_dashboard():
 
 @app.get("/")
 def home():
-    return {"status": "V3.10 Stable", "updates": ["Fixed Syntax", "Bulk Download", "Table Alignment"]}
+    return {"status": "V3.11 Ready", "fix": "itemdoubleclick set to toggleothers"}
