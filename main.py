@@ -11,6 +11,7 @@ import threading
 import time
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+import plotly.express as px
 
 app = FastAPI()
 
@@ -22,15 +23,22 @@ try:
 except:
     supabase = None
 
-# The 7 Strategic Assets
+# --- V3.0 EXPANDED ASSET LIST (34 TICKERS) ---
 TICKERS = {
-    "Gold": "GC=F", 
-    "Oil": "CL=F", 
-    "Copper": "HG=F", 
-    "Silver": "SI=F", 
-    "Natural_Gas": "NG=F", 
-    "Lithium": "LIT", 
-    "Uranium": "URA" 
+    # Energy
+    "Crude_Oil": "CL=F", "Brent_Oil": "BZ=F", "Natural_Gas": "NG=F", 
+    "Gasoline": "RB=F", "Heating_Oil": "HO=F", "Uranium": "URA",
+    # Industrial Metals
+    "Copper": "HG=F", "Aluminum": "ALI=F", "Nickel": "NICKEL", 
+    "Zinc": "ZINC", "Lithium": "LIT", "Steel": "SLX", "Iron_Ore": "TIO=F",
+    # Precious Metals
+    "Gold": "GC=F", "Silver": "SI=F", "Platinum": "PL=F", "Palladium": "PA=F",
+    # Agriculture
+    "Corn": "ZC=F", "Wheat": "ZW=F", "Soybeans": "ZS=F", "Coffee": "KC=F", 
+    "Sugar": "SB=F", "Cocoa": "CC=F", "Cotton": "CT=F", "Live_Cattle": "LC=F",
+    # Macro & Future
+    "Dollar_Index": "DX=F", "SP500": "^GSPC", "VIX_Index": "^VIX", 
+    "Bitcoin": "BTC-USD", "Carbon_Credits": "KRBN"
 }
 
 # --- QUANT & AI ENGINE ---
@@ -41,35 +49,34 @@ def calculate_rsi(prices, period=14):
     delta = pd.Series(prices).diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
-    rs = gain / loss
+    rs = gain / (loss + 1e-9)
     rsi = 100 - (100 / (1 + rs))
     return round(rsi.iloc[-1], 2)
 
 def calculate_forecast(prices_list):
-    """Linear Regression to predict the next trend value."""
+    """Linear Regression to predict next trend value."""
     y = np.array(prices_list)
     X = np.arange(len(y)).reshape(-1, 1)
     model = LinearRegression()
     model.fit(X, y)
     confidence = round(model.score(X, y), 4)
-    next_index = np.array([[len(y)]])
-    prediction = round(model.predict(next_index)[0], 2)
+    prediction = round(model.predict(np.array([[len(y)]]))[0], 2)
     return prediction, confidence
 
-# --- BACKGROUND WORKER (The "Tap" that never stops) ---
+# --- BACKGROUND WORKER V3.0 ---
 def background_worker():
-    """Fetches data every 15 minutes and saves to Supabase."""
+    """Updates 34 assets every 15 minutes."""
     while True:
-        print(f"[{datetime.datetime.now()}] Refreshing 15-min data for 7 assets...")
+        print(f"[{datetime.datetime.now()}] Refreshing 34 global assets...")
         for name, ticker_id in TICKERS.items():
             try:
                 ticker = yf.Ticker(ticker_id)
                 hist = ticker.history(period="2d")
-                if len(hist) < 1: continue
+                if hist.empty: continue
                 
                 price = round(hist['Close'].iloc[-1], 2)
-                # Trend based on the mean of the last 2 days
-                trend = "BULLISH" if price > hist['Close'].mean() else "BEARISH"
+                mean_price = hist['Close'].mean()
+                trend = "BULLISH" if price > mean_price else "BEARISH"
                 
                 if supabase:
                     supabase.table("precios_historicos").insert({
@@ -77,14 +84,16 @@ def background_worker():
                         "precio": price, 
                         "tendencia": trend
                     }).execute()
+                
+                # Small pause to avoid Yahoo Finance rate limiting
+                time.sleep(1.2) 
             except Exception as e:
                 print(f"Worker Error on {name}: {e}")
-                continue
         
-        print("Update complete. Sleeping for 900 seconds...")
+        print("Global update complete. Sleeping for 900 seconds...")
         time.sleep(900)
 
-# Start the worker in a separate thread
+# Start background thread
 threading.Thread(target=background_worker, daemon=True).start()
 
 # --- ENDPOINTS ---
@@ -92,23 +101,22 @@ threading.Thread(target=background_worker, daemon=True).start()
 @app.get("/")
 def home():
     return {
-        "platform": "Quant-Commodities AI V2.0",
+        "platform": "Quant-Commodities Global Radar V3.0",
+        "monitored_assets": len(TICKERS),
         "status": "online",
-        "endpoints": ["/market-intelligence", "/historical-stats", "/premium-forecast", "/visual-dashboard"]
+        "author": "Marcos"
     }
 
-# 1. Market Intelligence (All 7 Assets)
 @app.get("/market-intelligence")
 def get_market_intelligence():
-    """Returns price, RSI, SMA and Sentiment for all assets."""
+    """Returns real-time quant metrics for all assets."""
     analysis = {}
     for name, ticker_id in TICKERS.items():
         try:
-            ticker = yf.Ticker(ticker_id)
-            hist = ticker.history(period="30d", interval="1h")
+            hist = yf.Ticker(ticker_id).history(period="30d", interval="1h")
+            if hist.empty: continue
             prices = hist['Close']
             current_val = round(prices.iloc[-1], 2)
-            
             rsi = calculate_rsi(prices)
             sma20 = round(prices.rolling(20).mean().iloc[-1], 2)
             
@@ -116,96 +124,94 @@ def get_market_intelligence():
                 "price": current_val,
                 "rsi_14": rsi,
                 "sma_20": sma20,
-                "trend": "BULLISH" if current_val > sma20 else "BEARISH",
                 "sentiment": "OVERBOUGHT" if rsi > 70 else "OVERSOLD" if rsi < 30 else "NEUTRAL"
             }
         except: continue
     return analysis
 
-# 2. Historical Stats (Specific Asset)
-@app.get("/historical-stats")
-def get_historical_stats(asset: str = "Uranium"):
-    """Fetches historical records from Supabase and returns stats."""
-    if not supabase: return {"error": "DB connection failed"}
-    if asset not in TICKERS: return {"error": "Invalid asset"}
-
-    try:
-        response = supabase.table("precios_historicos").select("precio").eq("activo", asset).order("id", desc=True).limit(20).execute()
-        prices = [row['precio'] for row in response.data]
-        
-        if len(prices) < 2: return {"message": "Collecting more data..."}
-        
-        return {
-            "asset": asset,
-            "avg_price": round(sum(prices)/len(prices), 2),
-            "volatility": round(pd.Series(prices).std(), 4),
-            "max": max(prices),
-            "min": min(prices)
-        }
-    except Exception as e: return {"error": str(e)}
-
-# 3. Premium AI Forecast (Specific Asset)
-@app.get("/premium-forecast")
-def get_premium_forecast(asset: str = "Uranium"):
-    """Advanced AI Trend Prediction."""
-    if not supabase: return {"error": "DB connection failed"}
-    if asset not in TICKERS: return {"error": "Invalid asset"}
-
-    try:
-        response = supabase.table("precios_historicos").select("precio").eq("activo", asset).order("id", desc=True).limit(30).execute()
-        prices = [row['precio'] for row in response.data]
-        prices.reverse()
-        
-        if len(prices) < 15: return {"status": "warming_up", "data_points": len(prices)}
-        
-        prediction, confidence = calculate_forecast(prices)
-        current = prices[-1]
-        rsi = calculate_rsi(prices)
-        
-        return {
-            "asset": asset,
-            "current_price": current,
-            "rsi": rsi,
-            "forecast_next_24h": prediction,
-            "ai_confidence": confidence,
-            "signal": "UPWARD" if prediction > current else "DOWNWARD",
-            "alert": "High reversal risk" if (rsi > 70 or rsi < 30) else "Stable trend"
-        }
-    except Exception as e: return {"error": str(e)}
-
-# 4. Visual Dashboard (Institutional Chart)
 @app.get("/visual-dashboard", response_class=HTMLResponse)
 def get_dashboard():
-    """Generates the professional dark chart for all 7 assets."""
+    """Generates the institutional terminal for 34 assets."""
     fig = make_subplots(
         rows=2, cols=1, shared_xaxes=True, 
-        vertical_spacing=0.07, row_heights=[0.7, 0.3],
-        subplot_titles=("Cumulative Performance (%)", "RSI Momentum (14)")
+        vertical_spacing=0.05, row_heights=[0.7, 0.3],
+        subplot_titles=("Global Cumulative Performance (%)", "RSI Momentum Indicators")
     )
     
-    colors = ['#636EFA', '#EF553B', '#00CC96', '#AB63FA', '#FFA15A', '#19D3F3', '#FF6692']
+    # Dynamic color palette for 34 assets
+    colors = px.colors.qualitative.Alphabet + px.colors.qualitative.Dark24
     
     for i, (name, ticker_id) in enumerate(TICKERS.items()):
-        hist = yf.Ticker(ticker_id).history(period="7d", interval="1h")
-        if hist.empty: continue
-        
-        # Perf %
-        perf = (hist['Close'] / hist['Close'].iloc[0] - 1) * 100
-        fig.add_trace(go.Scatter(x=hist.index, y=perf, name=name, line=dict(color=colors[i], width=2)), row=1, col=1)
-        
-        # RSI
-        delta = hist['Close'].diff()
-        gain = delta.where(delta > 0, 0).rolling(14).mean()
-        loss = -delta.where(delta < 0, 0).rolling(14).mean()
-        rsi_vals = 100 - (100 / (1 + (gain/loss)))
-        fig.add_trace(go.Scatter(x=hist.index, y=rsi_vals, showlegend=False, line=dict(color=colors[i], width=1)), row=2, col=1)
+        try:
+            hist = yf.Ticker(ticker_id).history(period="7d", interval="1h")
+            if hist.empty: continue
+            
+            # Performance calculation
+            perf = (hist['Close'] / hist['Close'].iloc[0] - 1) * 100
+            color = colors[i % len(colors)]
+            
+            # Main Price Trace
+            fig.add_trace(go.Scatter(
+                x=hist.index, y=perf, name=name, 
+                line=dict(color=color, width=1.5),
+                hovertemplate='%{y:.2f}%'
+            ), row=1, col=1)
+            
+            # RSI Trace
+            delta = hist['Close'].diff()
+            gain = delta.where(delta > 0, 0).rolling(14).mean()
+            loss = -delta.where(delta < 0, 0).rolling(14).mean()
+            rsi_vals = 100 - (100 / (1 + (gain/loss + 1e-9)))
+            
+            fig.add_trace(go.Scatter(
+                x=hist.index, y=rsi_vals, showlegend=False, 
+                line=dict(color=color, width=1, dash='dot'),
+                opacity=0.4
+            ), row=2, col=1)
+        except: continue
 
     fig.update_layout(
-        template="plotly_dark", height=850, paper_bgcolor="#121212", plot_bgcolor="#1d1d1d",
-        title_text="Quant-Commodities Institutional Terminal", title_x=0.5,
-        hovermode="x unified", font=dict(family="Arial", size=12)
+        template="plotly_dark", height=950, 
+        paper_bgcolor="#0a0a0a", plot_bgcolor="#0a0a0a",
+        title_text="GLOBAL QUANT RADAR V3.0", title_x=0.5,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1, font=dict(size=9)),
+        hovermode="x unified"
     )
+    # Threshold lines for RSI
     fig.add_hline(y=70, line_dash="dash", line_color="red", opacity=0.3, row=2, col=1)
     fig.add_hline(y=30, line_dash="dash", line_color="green", opacity=0.3, row=2, col=1)
 
     return fig.to_html(full_html=True, include_plotlyjs='cdn')
+
+@app.get("/historical-stats")
+def get_historical_stats(asset: str = "Uranium"):
+    if not supabase: return {"error": "DB connection failed"}
+    try:
+        response = supabase.table("precios_historicos").select("precio").eq("activo", asset).order("id", desc=True).limit(20).execute()
+        prices = [row['precio'] for row in response.data]
+        if len(prices) < 2: return {"message": "Collecting more data points..."}
+        return {
+            "asset": asset, 
+            "avg_price": round(sum(prices)/len(prices), 2), 
+            "max": max(prices), 
+            "min": min(prices),
+            "data_points": len(prices)
+        }
+    except Exception as e: return {"error": str(e)}
+
+@app.get("/premium-forecast")
+def get_premium_forecast(asset: str = "Uranium"):
+    if not supabase: return {"error": "DB connection failed"}
+    try:
+        response = supabase.table("precios_historicos").select("precio").eq("activo", asset).order("id", desc=True).limit(30).execute()
+        prices = [row['precio'] for row in response.data]
+        prices.reverse()
+        if len(prices) < 15: return {"status": "warming_up", "current_points": len(prices)}
+        prediction, confidence = calculate_forecast(prices)
+        return {
+            "asset": asset, 
+            "forecast_24h": prediction, 
+            "confidence_r2": confidence,
+            "signal": "BUY/UP" if prediction > prices[-1] else "SELL/DOWN"
+        }
+    except Exception as e: return {"error": str(e)}
