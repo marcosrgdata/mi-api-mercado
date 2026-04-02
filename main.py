@@ -44,7 +44,7 @@ CATEGORIZED_TICKERS = {
 
 ALL_TICKERS = {k: v for cat in CATEGORIZED_TICKERS.values() for k, v in cat.items()}
 
-# --- QUANT & PREDICTION ENGINE ---
+# --- QUANT & MOMENTUM ENGINE ---
 def calculate_rsi(prices, period=14):
     if len(prices) < period: return 50
     delta = prices.diff()
@@ -54,15 +54,25 @@ def calculate_rsi(prices, period=14):
     rsi = 100 - (100 / (1 + rs))
     return round(rsi.iloc[-1], 2)
 
-def get_projection(data_series, hours_ahead=24):
-    """Calculates linear forecast for the next N hours."""
-    y = data_series.values.reshape(-1, 1)
+def get_momentum_projection(data_series, hours_ahead=24):
+    """Calculates a projection based on the most recent momentum (last 30 data points)."""
+    # We only take the last 30 hours to capture the CURRENT trend
+    window = data_series.tail(30)
+    y = window.values.reshape(-1, 1)
     X = np.arange(len(y)).reshape(-1, 1)
+    
     model = LinearRegression()
     model.fit(X, y)
-    future_X = np.arange(len(y), len(y) + hours_ahead).reshape(-1, 1)
-    future_y = model.predict(future_X)
-    return future_y.flatten()
+    
+    # Calculate the slope (momentum)
+    slope = model.coef_[0][0]
+    
+    # We force the projection to START at the last real value (Seamless transition)
+    last_val = data_series.iloc[-1]
+    future_steps = np.arange(1, hours_ahead + 1)
+    projection = last_val + (slope * future_steps)
+    
+    return projection
 
 # --- BACKGROUND WORKER ---
 def background_worker():
@@ -89,13 +99,13 @@ def get_dashboard():
         raw_data = yf.download(ticker_ids, period="7d", interval="1h", group_by='ticker', threads=True)
         
         if raw_data.empty:
-            return HTMLResponse("<h1>Data Unavailable</h1><p>Yahoo Finance returned no data. Please refresh.</p>")
+            return HTMLResponse("<h1>Data Unavailable</h1><p>Yahoo Finance returned no data.</p>")
 
         market_data = []
         fig = make_subplots(
             rows=2, cols=1, shared_xaxes=True, 
             vertical_spacing=0.12, row_heights=[0.65, 0.35],
-            subplot_titles=("RELATIVE PERFORMANCE & PROJECTION (%)", "MOMENTUM INDEX (RSI 14)")
+            subplot_titles=("RELATIVE PERFORMANCE & MOMENTUM PROJECTION (%)", "MOMENTUM INDEX (RSI 14)")
         )
         
         sector_colors = {"Energy": "#ef4444", "Metals": "#f59e0b", "Agriculture": "#10b981", "Macro_Crypto": "#3b82f6"}
@@ -105,14 +115,13 @@ def get_dashboard():
             for name, tid in assets.items():
                 try:
                     hist = raw_data[tid].dropna() if len(ticker_ids) > 1 else raw_data.dropna()
-                    if hist.empty or len(hist) < 10: continue
+                    if hist.empty or len(hist) < 30: continue
                     
                     start_p = hist['Close'].iloc[0]
-                    current_p = hist['Close'].iloc[-1]
                     perf_series = ((hist['Close'] / start_p) - 1) * 100
                     color = sector_colors[sector]
                     
-                    # A. ACTUAL PERFORMANCE
+                    # A. ACTUAL PERFORMANCE (Solid Line)
                     fig.add_trace(go.Scatter(
                         x=hist.index, y=perf_series, 
                         name=name, legendgroup=name,
@@ -120,17 +129,18 @@ def get_dashboard():
                         hovertemplate='<b>'+name+'</b>: %{y:.2f}%<extra></extra>'
                     ), row=1, col=1)
 
-                    # B. PREDICTION (Faint dot line)
-                    proj_y = get_projection(perf_series, hours_ahead=24)
+                    # B. MOMENTUM PROJECTION (Seamless Dotted Line)
+                    proj_y = get_momentum_projection(perf_series, hours_ahead=24)
                     future_index = pd.date_range(start=hist.index[-1], periods=25, freq='h')[1:]
                     
+                    # We start exactly at the last point of history
                     fig.add_trace(go.Scatter(
                         x=[hist.index[-1]] + list(future_index), 
                         y=[perf_series.iloc[-1]] + list(proj_y),
                         name=f"{name} Forecast", legendgroup=name, showlegend=False,
                         line=dict(color=color, width=2, dash='dot'),
                         opacity=0.3, 
-                        hovertemplate='<b>'+name+' Projection</b>: %{y:.2f}%<extra></extra>'
+                        hovertemplate='<b>'+name+' Project.</b>: %{y:.2f}%<extra></extra>'
                     ), row=1, col=1)
                     
                     # C. RSI
@@ -143,14 +153,11 @@ def get_dashboard():
                         legendgroup=name, line=dict(color=color, width=1, dash='dot'), opacity=0.2
                     ), row=2, col=1)
 
-                    market_data.append({"Asset": name, "Sector": sector, "Price": round(current_p, 2), "Perf": round(perf_series.iloc[-1], 2), "RSI": calculate_rsi(hist['Close'])})
+                    market_data.append({"Asset": name, "Sector": sector, "Price": round(hist['Close'].iloc[-1], 2), "Perf": round(perf_series.iloc[-1], 2), "RSI": calculate_rsi(hist['Close'])})
                     trace_counter += 3 
                 except: continue
 
-        if not market_data:
-            return HTMLResponse("<h1>Analysis Error</h1><p>Could not process any assets. Verify market hours.</p>")
-
-        # 2. BUTTONS CONFIG (Step 3: Price, Proj, RSI)
+        # 2. UI & BUTTONS
         buttons = [dict(method="restyle", label="GLOBAL VIEW", args=[{"visible": [True] * trace_counter}])]
         for target_sector in CATEGORIZED_TICKERS.keys():
             visibility = []
@@ -163,7 +170,7 @@ def get_dashboard():
         fig.update_layout(
             template="plotly_dark", height=850, margin=dict(t=180, b=50, l=60, r=60),
             paper_bgcolor="#0a0a0a", plot_bgcolor="#0a0a0a",
-            title_text="GLOBAL QUANT TERMINAL V3.17.1", title_x=0.5, title_y=0.98,
+            title_text="GLOBAL QUANT TERMINAL V3.18", title_x=0.5, title_y=0.98,
             hovermode="x unified",
             legend=dict(itemclick="toggleothers", itemdoubleclick="toggle", font=dict(size=10, color="white"), orientation="v", x=1.02, y=0.5),
             updatemenus=[dict(
@@ -178,7 +185,7 @@ def get_dashboard():
         <style>
             rect.updatemenu-item-rect { fill: #1e293b !important; stroke: #334155 !important; }
             rect.updatemenu-item-rect:hover { fill: #334155 !important; }
-            rect.updatemenu-item-rect[fill="#F4F4F4"], rect.updatemenu-item-rect.active { fill: #2563eb !important; }
+            rect.updatemenu-item-rect[fill="#F4F4F4"], rect.updatemenu-item-rect[fill="#f4f4f4"], rect.updatemenu-item-rect.active { fill: #2563eb !important; }
             text.updatemenu-item-text { fill: #ffffff !important; font-weight: bold !important; pointer-events: none !important; }
             table { width: 100%; border-collapse: collapse; table-layout: fixed; margin-top: 20px; color: white; }
             th { padding: 15px; text-align: left; background-color: #111827; color: #94a3b8; border-bottom: 2px solid #1f2937; }
