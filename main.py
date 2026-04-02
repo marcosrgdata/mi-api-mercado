@@ -42,10 +42,10 @@ CATEGORIZED_TICKERS = {
 }
 
 ALL_TICKERS = {k: v for cat in CATEGORIZED_TICKERS.values() for k, v in cat.items()}
-REVERSE_TICKERS = {v: k for k, v in ALL_TICKERS.items()}
 
 # --- QUANT ENGINE ---
 def calculate_rsi(prices, period=14):
+    """Calculates the RSI for a given series of prices."""
     if len(prices) < period: return 50
     delta = prices.diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
@@ -56,8 +56,8 @@ def calculate_rsi(prices, period=14):
 
 # --- BACKGROUND WORKER ---
 def background_worker():
+    """Background task to store historical data points."""
     while True:
-        # Small delay between assets to avoid rate limits
         for name, ticker_id in ALL_TICKERS.items():
             try:
                 t = yf.Ticker(ticker_id)
@@ -65,17 +65,17 @@ def background_worker():
                 if not h.empty and supabase:
                     p = round(h['Close'].iloc[-1], 2)
                     supabase.table("precios_historicos").insert({"activo": name, "precio": p}).execute()
-                time.sleep(2)
+                time.sleep(1.5)
             except: continue
         time.sleep(900)
 
 threading.Thread(target=background_worker, daemon=True).start()
 
-# --- DASHBOARD GENERATOR (TURBO VERSION) ---
+# --- DASHBOARD GENERATOR ---
 @app.get("/visual-dashboard", response_class=HTMLResponse)
 def get_dashboard():
     try:
-        # 1. BULK DOWNLOAD (The fix for 500 error)
+        # 1. BULK DOWNLOAD
         ticker_ids = list(ALL_TICKERS.values())
         raw_data = yf.download(ticker_ids, period="7d", interval="1h", group_by='ticker', threads=True)
         
@@ -92,9 +92,12 @@ def get_dashboard():
         for sector, assets in CATEGORIZED_TICKERS.items():
             for name, tid in assets.items():
                 try:
-                    # Access data from bulk download
-                    hist = raw_data[tid] if len(ticker_ids) > 1 else raw_data
-                    hist = hist.dropna()
+                    # Robust data extraction from MultiIndex DataFrame
+                    if len(ticker_ids) > 1:
+                        hist = raw_data[tid].dropna()
+                    else:
+                        hist = raw_data.dropna()
+
                     if hist.empty or len(hist) < 2: continue
                     
                     start_p = hist['Close'].iloc[0]
@@ -117,10 +120,11 @@ def get_dashboard():
                     delta = hist['Close'].diff()
                     gain = delta.where(delta > 0, 0).rolling(14).mean()
                     loss = -delta.where(delta < 0, 0).rolling(14).mean()
-                    rsi_vals = 100 - (100 / (1 + (gain/(loss + 1e-9)))))
+                    rs_val = gain / (loss + 1e-9)
+                    rsi_line = 100 - (100 / (1 + rs_val))
                     
                     fig.add_trace(go.Scatter(
-                        x=hist.index, y=rsi_vals, showlegend=False,
+                        x=hist.index, y=rsi_line, showlegend=False,
                         legendgroup=sector, line=dict(color=color, width=1, dash='dot'),
                         opacity=0.3
                     ), row=2, col=1)
@@ -140,7 +144,7 @@ def get_dashboard():
         fig.update_layout(
             template="plotly_dark", height=850, margin=dict(t=180, b=50, l=60, r=60),
             paper_bgcolor="#0a0a0a", plot_bgcolor="#0a0a0a",
-            title_text="GLOBAL QUANT TERMINAL V3.9", title_x=0.5, title_y=0.98,
+            title_text="GLOBAL QUANT TERMINAL V3.10", title_x=0.5, title_y=0.98,
             hovermode="x unified",
             legend=dict(itemclick="toggle", itemdoubleclick="isolate", font=dict(size=10), orientation="v", x=1.02, y=0.5),
             updatemenus=[dict(
@@ -161,13 +165,12 @@ def get_dashboard():
                     <td style="padding: 12px; font-family: monospace;">{row['Price']}</td>
                     <td style="padding: 12px; color: {p_color}; font-weight: bold;">{row['Perf']}%</td>
                     <td style="padding: 12px;">{row['RSI']}</td>
-                </tr>
-            """
+                </tr>"""
 
         table_html = f"""
         <div style="background-color: #0a0a0a; color: white; font-family: sans-serif; padding: 40px;">
-            <h2 style="text-align: center; color: #64748b;">MARKET SUMMARY</h2>
-            <table style="width: 100%; border-collapse: collapse; table-layout: fixed;">
+            <h2 style="text-align: center; color: #64748b; letter-spacing: 2px;">MARKET SUMMARY</h2>
+            <table style="width: 100%; border-collapse: collapse; table-layout: fixed; margin-top: 20px;">
                 <thead>
                     <tr style="background-color: #111827; color: #94a3b8; text-align: left; border-bottom: 2px solid #1f2937;">
                         <th style="padding: 15px; width: 25%;">ASSET</th><th style="padding: 15px; width: 20%;">SECTOR</th>
@@ -177,14 +180,14 @@ def get_dashboard():
                 </thead>
                 <tbody>{table_rows}</tbody>
             </table>
-        </div>
-        """
+        </div>"""
         
-        return HTMLResponse(content=f"<html><body style='margin:0; background:#0a0a0a;'>{fig.to_html(full_html=False, include_plotlyjs='cdn')}{table_html}</body></html>")
+        chart_html = fig.to_html(full_html=False, include_plotlyjs='cdn')
+        return HTMLResponse(content=f"<html><body style='margin:0; background:#0a0a0a;'>{chart_html}{table_html}</body></html>")
     
     except Exception as e:
-        return HTMLResponse(content=f"<html><body><h1>Dashboard Error</h1><p>{str(e)}</p></body></html>", status_code=500)
+        return HTMLResponse(content=f"<html><body style='background:#111; color:white; padding:20px;'><h1>Dashboard Error</h1><code>{str(e)}</code></body></html>", status_code=500)
 
 @app.get("/")
 def home():
-    return {"status": "V3.9 Turbo", "engine": "Bulk Data Fetching"}
+    return {"status": "V3.10 Stable", "updates": ["Fixed Syntax", "Bulk Download", "Table Alignment"]}
