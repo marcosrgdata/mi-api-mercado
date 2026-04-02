@@ -3,7 +3,6 @@ from fastapi.responses import HTMLResponse
 import yfinance as yf
 import pandas as pd
 from supabase import create_client, Client
-from sklearn.linear_model import LinearRegression
 import numpy as np
 import os
 import datetime
@@ -46,7 +45,6 @@ CATEGORIZED_TICKERS = {
 ALL_TICKERS = {k: v for cat in CATEGORIZED_TICKERS.values() for k, v in cat.items()}
 
 # --- QUANT ENGINE ---
-
 def calculate_rsi(prices, period=14):
     if len(prices) < period: return 50
     delta = pd.Series(prices).diff()
@@ -59,7 +57,7 @@ def calculate_rsi(prices, period=14):
 # --- BACKGROUND WORKER ---
 def background_worker():
     while True:
-        print(f"[{datetime.datetime.now()}] Worker: Syncing 25 assets...")
+        print(f"[{datetime.datetime.now()}] Worker: Syncing assets...")
         for name, ticker_id in ALL_TICKERS.items():
             try:
                 ticker = yf.Ticker(ticker_id)
@@ -67,27 +65,22 @@ def background_worker():
                 if hist.empty: continue
                 price = round(hist['Close'].iloc[-1], 2)
                 if supabase:
-                    supabase.table("precios_historicos").insert({
-                        "activo": name, "precio": price, "tendencia": "N/A"
-                    }).execute()
+                    supabase.table("precios_historicos").insert({"activo": name, "precio": price}).execute()
                 time.sleep(1)
-            except Exception as e:
-                print(f"Error on {name}: {e}")
+            except: continue
         time.sleep(900)
 
 threading.Thread(target=background_worker, daemon=True).start()
 
 # --- DASHBOARD GENERATOR ---
-
 @app.get("/visual-dashboard", response_class=HTMLResponse)
 def get_dashboard():
-    # 1. Gather Data and Compute Stats for Table
     market_data = []
-    
     fig = make_subplots(
         rows=2, cols=1, shared_xaxes=True, 
-        vertical_spacing=0.07, row_heights=[0.7, 0.3],
-        subplot_titles=("Relative Sector Performance (%)", "RSI Momentum Indicators")
+        vertical_spacing=0.1, # Increased spacing for labels
+        row_heights=[0.65, 0.35],
+        subplot_titles=("RELATIVE SECTOR PERFORMANCE (%)", "RSI MOMENTUM INDICATORS")
     )
     
     sector_colors = {
@@ -102,27 +95,20 @@ def get_dashboard():
                 hist = yf.Ticker(ticker_id).history(period="7d", interval="1h")
                 if hist.empty or len(hist) < 2: continue
                 
-                # Performance & Stats
-                current_price = hist['Close'].iloc[-1]
                 start_price = hist['Close'].iloc[0]
-                daily_perf = ((current_price / start_price) - 1) * 100
+                current_price = hist['Close'].iloc[-1]
+                perf = ((current_price / start_price) - 1) * 100
                 rsi = calculate_rsi(hist['Close'])
                 
-                market_data.append({
-                    "Asset": name, "Sector": sector, 
-                    "Price": round(current_price, 2), 
-                    "Perf %": round(daily_perf, 2),
-                    "RSI": rsi
-                })
-
+                market_data.append({"Asset": name, "Sector": sector, "Price": round(current_price, 2), "Perf": round(perf, 2), "RSI": rsi})
                 color = sector_colors[sector]
                 
                 # Performance Trace
                 fig.add_trace(go.Scatter(
                     x=hist.index, y=(hist['Close']/start_price-1)*100, 
                     name=name, legendgroup=sector,
-                    line=dict(color=color, width=1.8),
-                    hovertemplate='%{y:.2f}%'
+                    line=dict(color=color, width=2),
+                    hovertemplate='<b>%{fullData.name}</b><br>Perf: %{y:.2f}%<extra></extra>'
                 ), row=1, col=1)
                 
                 # RSI Trace
@@ -133,13 +119,13 @@ def get_dashboard():
                 fig.add_trace(go.Scatter(
                     x=hist.index, y=rsi_vals, showlegend=False,
                     legendgroup=sector, line=dict(color=color, width=1, dash='dot'),
-                    opacity=0.3
+                    opacity=0.3, hovertemplate='%{fullData.name} RSI: %{y:.2f}<extra></extra>'
                 ), row=2, col=1)
                 
                 trace_counter += 2
             except: continue
 
-    # 2. Build Buttons
+    # --- BUTTONS CONFIGURATION (FIXED OVERLAP & COLORS) ---
     buttons = [dict(method="restyle", label="View All", args=[{"visible": [True] * trace_counter}])]
     for target_sector in CATEGORIZED_TICKERS.keys():
         visibility = []
@@ -150,64 +136,52 @@ def get_dashboard():
         buttons.append(dict(method="restyle", label=target_sector, args=[{"visible": visibility}]))
 
     fig.update_layout(
-        template="plotly_dark", height=800, 
+        template="plotly_dark", height=900, 
+        margin=dict(t=160, b=50, l=50, r=50), # Large top margin for buttons
         paper_bgcolor="#0a0a0a", plot_bgcolor="#0a0a0a",
-        title_text="GLOBAL QUANT RADAR V3.6", title_x=0.5,
+        title_text="GLOBAL QUANT RADAR V3.7", title_x=0.5, title_y=0.97,
         hovermode="x unified",
+        legend=dict(
+            itemclick="toggleothers", # SINGLE CLICK = Toggle, DOUBLE CLICK = Isolate
+            itemdoubleclick="toggle",
+            font=dict(size=10), orientation="v", x=1.02, y=0.5
+        ),
         updatemenus=[dict(
-            type="buttons", direction="right", x=0.5, y=1.08, 
-            xanchor="center", buttons=buttons, bgcolor="#1e293b"
+            type="buttons", direction="right", x=0.5, y=1.15, # Positioned above titles
+            xanchor="center", yanchor="top",
+            buttons=buttons,
+            bgcolor="#1e293b", font=dict(color="#ffffff", size=12),
+            active=0, # Highlight the first button initially
+            bordercolor="#475569"
         )]
     )
 
-    # 3. Create HTML Summary Table (The "Perfection" Step)
-    df_market = pd.DataFrame(market_data).sort_values(by="Perf %", ascending=False)
-    
-    def get_color(val):
-        return "#10b981" if val > 0 else "#ef4444"
-
+    # --- MARKET INTELLIGENCE TABLE ---
+    df_market = pd.DataFrame(market_data).sort_values(by="Perf", ascending=False)
     table_html = """
-    <div style="background-color: #0a0a0a; color: white; font-family: Arial; padding: 20px;">
-        <h2 style="text-align: center;">Market Intelligence Summary</h2>
-        <table style="width: 100%; border-collapse: collapse; text-align: left; background-color: #111;">
-            <thead>
-                <tr style="border-bottom: 2px solid #333;">
-                    <th style="padding: 12px;">Asset</th>
-                    <th style="padding: 12px;">Sector</th>
-                    <th style="padding: 12px;">Price</th>
-                    <th style="padding: 12px;">7d Perf %</th>
-                    <th style="padding: 12px;">RSI (14)</th>
-                </tr>
-            </thead>
-            <tbody>
+    <div style="background-color: #0a0a0a; color: white; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; padding: 40px;">
+        <h2 style="text-align: center; color: #94a3b8; border-bottom: 1px solid #334155; padding-bottom: 10px;">LIVE MARKET INTELLIGENCE</h2>
+        <table style="width: 100%; border-collapse: collapse; margin-top: 20px;">
+            <tr style="background-color: #1e293b; color: #cbd5e1; text-transform: uppercase; font-size: 0.85em;">
+                <th style="padding: 15px;">Asset</th><th style="padding: 15px;">Sector</th><th style="padding: 15px;">Price</th><th style="padding: 15px;">7d Performance</th><th style="padding: 15px;">RSI (14)</th>
+            </tr>
     """
     for _, row in df_market.iterrows():
-        color = get_color(row['Perf %'])
+        perf_color = "#10b981" if row['Perf'] > 0 else "#ef4444"
         table_html += f"""
-                <tr style="border-bottom: 1px solid #222;">
-                    <td style="padding: 10px;">{row['Asset']}</td>
-                    <td style="padding: 10px; font-size: 0.8em; color: #888;">{row['Sector']}</td>
-                    <td style="padding: 10px; font-weight: bold;">{row['Price']}</td>
-                    <td style="padding: 10px; color: {color};">{row['Perf %']}%</td>
-                    <td style="padding: 10px;">{row['RSI']}</td>
-                </tr>
+            <tr style="border-bottom: 1px solid #1e293b; font-size: 0.95em;">
+                <td style="padding: 12px;"><b>{row['Asset']}</b></td>
+                <td style="padding: 12px; color: #64748b;">{row['Sector']}</td>
+                <td style="padding: 12px; font-family: monospace;">{row['Price']}</td>
+                <td style="padding: 12px; color: {perf_color}; font-weight: bold;">{row['Perf']}%</td>
+                <td style="padding: 12px;">{row['RSI']}</td>
+            </tr>
         """
-    table_html += "</tbody></table></div>"
+    table_html += "</table></div>"
 
-    # Combine Plot + Table
     full_html = fig.to_html(full_html=False, include_plotlyjs='cdn')
-    final_page = f"""
-    <html>
-        <head><title>Quant Terminal V3.6</title></head>
-        <body style="background-color: #0a0a0a; margin: 0;">
-            {full_html}
-            {table_html}
-        </body>
-    </html>
-    """
-    return HTMLResponse(content=final_page)
+    return HTMLResponse(content=f"<html><body style='margin:0; background:#0a0a0a;'>{full_html}{table_html}</body></html>")
 
-# ... (Keep other endpoints like stats/forecast as they are) ...
 @app.get("/")
 def home():
-    return {"status": "V3.6 Active", "language": "English/Spanish Hybrid"}
+    return {"status": "V3.7 UI Optimized", "features": ["Safe Spacing", "Legend Isolation", "Sector Grouping"]}
