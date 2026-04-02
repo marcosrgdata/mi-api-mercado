@@ -57,7 +57,6 @@ def calculate_rsi(prices, period=14):
 # --- BACKGROUND WORKER ---
 def background_worker():
     while True:
-        print(f"[{datetime.datetime.now()}] Worker: Syncing assets...")
         for name, ticker_id in ALL_TICKERS.items():
             try:
                 ticker = yf.Ticker(ticker_id)
@@ -78,9 +77,9 @@ def get_dashboard():
     market_data = []
     fig = make_subplots(
         rows=2, cols=1, shared_xaxes=True, 
-        vertical_spacing=0.1, # Increased spacing for labels
+        vertical_spacing=0.12, 
         row_heights=[0.65, 0.35],
-        subplot_titles=("RELATIVE SECTOR PERFORMANCE (%)", "RSI MOMENTUM INDICATORS")
+        subplot_titles=("RELATIVE PERFORMANCE (%)", "MOMENTUM INDEX (RSI 14)")
     )
     
     sector_colors = {
@@ -95,20 +94,20 @@ def get_dashboard():
                 hist = yf.Ticker(ticker_id).history(period="7d", interval="1h")
                 if hist.empty or len(hist) < 2: continue
                 
-                start_price = hist['Close'].iloc[0]
-                current_price = hist['Close'].iloc[-1]
-                perf = ((current_price / start_price) - 1) * 100
+                start_p = hist['Close'].iloc[0]
+                current_p = hist['Close'].iloc[-1]
+                perf = ((current_p / start_p) - 1) * 100
                 rsi = calculate_rsi(hist['Close'])
                 
-                market_data.append({"Asset": name, "Sector": sector, "Price": round(current_price, 2), "Perf": round(perf, 2), "RSI": rsi})
+                market_data.append({"Asset": name, "Sector": sector, "Price": round(current_p, 2), "Perf": round(perf, 2), "RSI": rsi})
                 color = sector_colors[sector]
                 
-                # Performance Trace
+                # Perf Trace
                 fig.add_trace(go.Scatter(
-                    x=hist.index, y=(hist['Close']/start_price-1)*100, 
+                    x=hist.index, y=((hist['Close']/start_p)-1)*100, 
                     name=name, legendgroup=sector,
                     line=dict(color=color, width=2),
-                    hovertemplate='<b>%{fullData.name}</b><br>Perf: %{y:.2f}%<extra></extra>'
+                    hovertemplate='<b>'+name+'</b>: %{y:.2f}%<extra></extra>'
                 ), row=1, col=1)
                 
                 # RSI Trace
@@ -119,69 +118,71 @@ def get_dashboard():
                 fig.add_trace(go.Scatter(
                     x=hist.index, y=rsi_vals, showlegend=False,
                     legendgroup=sector, line=dict(color=color, width=1, dash='dot'),
-                    opacity=0.3, hovertemplate='%{fullData.name} RSI: %{y:.2f}<extra></extra>'
+                    opacity=0.3
                 ), row=2, col=1)
-                
                 trace_counter += 2
             except: continue
 
-    # --- BUTTONS CONFIGURATION (FIXED OVERLAP & COLORS) ---
-    buttons = [dict(method="restyle", label="View All", args=[{"visible": [True] * trace_counter}])]
+    # --- UI FIX: BUTTONS & VISIBILITY ---
+    buttons = [dict(method="restyle", label="GLOBAL VIEW", args=[{"visible": [True] * trace_counter}])]
     for target_sector in CATEGORIZED_TICKERS.keys():
         visibility = []
         for sector, assets in CATEGORIZED_TICKERS.items():
             for _ in assets:
                 val = (sector == target_sector)
                 visibility.extend([val, val])
-        buttons.append(dict(method="restyle", label=target_sector, args=[{"visible": visibility}]))
+        buttons.append(dict(method="restyle", label=target_sector.upper(), args=[{"visible": visibility}]))
 
     fig.update_layout(
         template="plotly_dark", height=900, 
-        margin=dict(t=160, b=50, l=50, r=50), # Large top margin for buttons
+        margin=dict(t=180, b=50, l=60, r=60), 
         paper_bgcolor="#0a0a0a", plot_bgcolor="#0a0a0a",
-        title_text="GLOBAL QUANT RADAR V3.7", title_x=0.5, title_y=0.97,
+        title_text="GLOBAL QUANT TERMINAL V3.8", title_x=0.5, title_y=0.98,
         hovermode="x unified",
         legend=dict(
-            itemclick="toggleothers", # SINGLE CLICK = Toggle, DOUBLE CLICK = Isolate
-            itemdoubleclick="toggle",
+            itemclick="toggle", # One click: hide/show
+            itemdoubleclick="isolate", # Double click: see ONLY this one
             font=dict(size=10), orientation="v", x=1.02, y=0.5
         ),
         updatemenus=[dict(
-            type="buttons", direction="right", x=0.5, y=1.15, # Positioned above titles
+            type="buttons", direction="right", x=0.5, y=1.2, 
             xanchor="center", yanchor="top",
             buttons=buttons,
-            bgcolor="#1e293b", font=dict(color="#ffffff", size=12),
-            active=0, # Highlight the first button initially
-            bordercolor="#475569"
+            bgcolor="#111827", # Darker background
+            font=dict(color="#ffffff", size=11), # Pure white text
+            active=0, bordercolor="#374151"
         )]
     )
 
-    # --- MARKET INTELLIGENCE TABLE ---
+    # --- UI FIX: TABLE ALIGNMENT ---
     df_market = pd.DataFrame(market_data).sort_values(by="Perf", ascending=False)
     table_html = """
-    <div style="background-color: #0a0a0a; color: white; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; padding: 40px;">
-        <h2 style="text-align: center; color: #94a3b8; border-bottom: 1px solid #334155; padding-bottom: 10px;">LIVE MARKET INTELLIGENCE</h2>
-        <table style="width: 100%; border-collapse: collapse; margin-top: 20px;">
-            <tr style="background-color: #1e293b; color: #cbd5e1; text-transform: uppercase; font-size: 0.85em;">
-                <th style="padding: 15px;">Asset</th><th style="padding: 15px;">Sector</th><th style="padding: 15px;">Price</th><th style="padding: 15px;">7d Performance</th><th style="padding: 15px;">RSI (14)</th>
-            </tr>
+    <div style="background-color: #0a0a0a; color: white; font-family: Arial, sans-serif; padding: 40px;">
+        <h2 style="text-align: center; color: #64748b; letter-spacing: 2px;">MARKET SUMMARY</h2>
+        <table style="width: 100%; border-collapse: collapse; margin-top: 20px; table-layout: fixed;">
+            <thead>
+                <tr style="background-color: #111827; color: #94a3b8; text-align: left; border-bottom: 2px solid #1f2937;">
+                    <th style="padding: 15px; width: 25%;">ASSET</th>
+                    <th style="padding: 15px; width: 20%;">SECTOR</th>
+                    <th style="padding: 15px; width: 20%;">PRICE</th>
+                    <th style="padding: 15px; width: 20%;">7D PERF</th>
+                    <th style="padding: 15px; width: 15%;">RSI</th>
+                </tr>
+            </thead>
+            <tbody>
     """
     for _, row in df_market.iterrows():
-        perf_color = "#10b981" if row['Perf'] > 0 else "#ef4444"
+        p_color = "#10b981" if row['Perf'] > 0 else "#ef4444"
         table_html += f"""
-            <tr style="border-bottom: 1px solid #1e293b; font-size: 0.95em;">
-                <td style="padding: 12px;"><b>{row['Asset']}</b></td>
-                <td style="padding: 12px; color: #64748b;">{row['Sector']}</td>
-                <td style="padding: 12px; font-family: monospace;">{row['Price']}</td>
-                <td style="padding: 12px; color: {perf_color}; font-weight: bold;">{row['Perf']}%</td>
-                <td style="padding: 12px;">{row['RSI']}</td>
-            </tr>
+                <tr style="border-bottom: 1px solid #1f2937; text-align: left;">
+                    <td style="padding: 12px; font-weight: bold;">{row['Asset']}</td>
+                    <td style="padding: 12px; color: #4b5563;">{row['Sector']}</td>
+                    <td style="padding: 12px;">{row['Price']}</td>
+                    <td style="padding: 12px; color: {p_color}; font-weight: bold;">{row['Perf']}%</td>
+                    <td style="padding: 12px;">{row['RSI']}</td>
+                </tr>
         """
-    table_html += "</table></div>"
+    table_html += "</tbody></table></div>"
 
-    full_html = fig.to_html(full_html=False, include_plotlyjs='cdn')
-    return HTMLResponse(content=f"<html><body style='margin:0; background:#0a0a0a;'>{full_html}{table_html}</body></html>")
-
-@app.get("/")
-def home():
-    return {"status": "V3.7 UI Optimized", "features": ["Safe Spacing", "Legend Isolation", "Sector Grouping"]}
+    chart_html = fig.to_html(full_html=False, include_plotlyjs='cdn')
+    return HTMLResponse(content=f"<html><body style='margin:0; background:#0a0a0a;'>{chart_html}{table_html}</body></html>")
