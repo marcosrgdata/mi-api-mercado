@@ -84,10 +84,13 @@ threading.Thread(target=background_worker, daemon=True).start()
 @app.get("/visual-dashboard", response_class=HTMLResponse)
 def get_dashboard():
     try:
-        # 1. PARALLEL DATA FETCH
+        # 1. BULK DATA FETCH
         ticker_ids = list(ALL_TICKERS.values())
         raw_data = yf.download(ticker_ids, period="7d", interval="1h", group_by='ticker', threads=True)
         
+        if raw_data.empty:
+            return HTMLResponse("<h1>Data Unavailable</h1><p>Yahoo Finance returned no data. Please refresh.</p>")
+
         market_data = []
         fig = make_subplots(
             rows=2, cols=1, shared_xaxes=True, 
@@ -102,14 +105,14 @@ def get_dashboard():
             for name, tid in assets.items():
                 try:
                     hist = raw_data[tid].dropna() if len(ticker_ids) > 1 else raw_data.dropna()
-                    if hist.empty or len(hist) < 5: continue
+                    if hist.empty or len(hist) < 10: continue
                     
                     start_p = hist['Close'].iloc[0]
                     current_p = hist['Close'].iloc[-1]
                     perf_series = ((hist['Close'] / start_p) - 1) * 100
                     color = sector_colors[sector]
                     
-                    # A. ACTUAL PERFORMANCE TRACE
+                    # A. ACTUAL PERFORMANCE
                     fig.add_trace(go.Scatter(
                         x=hist.index, y=perf_series, 
                         name=name, legendgroup=name,
@@ -117,47 +120,50 @@ def get_dashboard():
                         hovertemplate='<b>'+name+'</b>: %{y:.2f}%<extra></extra>'
                     ), row=1, col=1)
 
-                    # B. PREDICTION TRACE (Faint line)
+                    # B. PREDICTION (Faint dot line)
                     proj_y = get_projection(perf_series, hours_ahead=24)
-                    future_index = pd.date_range(start=hist.index[-1], periods=25, freq='H')[1:]
+                    future_index = pd.date_range(start=hist.index[-1], periods=25, freq='h')[1:]
                     
                     fig.add_trace(go.Scatter(
                         x=[hist.index[-1]] + list(future_index), 
                         y=[perf_series.iloc[-1]] + list(proj_y),
                         name=f"{name} Forecast", legendgroup=name, showlegend=False,
                         line=dict(color=color, width=2, dash='dot'),
-                        opacity=0.3, # FAINT COLOR
-                        hovertemplate='<b>'+name+' Forecast</b>: %{y:.2f}%<extra></extra>'
+                        opacity=0.3, 
+                        hovertemplate='<b>'+name+' Projection</b>: %{y:.2f}%<extra></extra>'
                     ), row=1, col=1)
                     
-                    # C. RSI TRACE
+                    # C. RSI
                     delta = hist['Close'].diff()
                     gain = delta.where(delta > 0, 0).rolling(14).mean()
                     loss = -delta.where(delta < 0, 0).rolling(14).mean()
                     rsi_line = 100 - (100 / (1 + (gain/(loss + 1e-9))))
                     fig.add_trace(go.Scatter(
                         x=hist.index, y=rsi_line, showlegend=False,
-                        legendgroup=name, line=dict(color=color, width=1, dash='dot'), opacity=0.3
+                        legendgroup=name, line=dict(color=color, width=1, dash='dot'), opacity=0.2
                     ), row=2, col=1)
 
                     market_data.append({"Asset": name, "Sector": sector, "Price": round(current_p, 2), "Perf": round(perf_series.iloc[-1], 2), "RSI": calculate_rsi(hist['Close'])})
-                    trace_counter += 3 # Updated to 3 traces per asset
+                    trace_counter += 3 
                 except: continue
 
-        # 2. BUTTONS CONFIG (Updated step to 3)
+        if not market_data:
+            return HTMLResponse("<h1>Analysis Error</h1><p>Could not process any assets. Verify market hours.</p>")
+
+        # 2. BUTTONS CONFIG (Step 3: Price, Proj, RSI)
         buttons = [dict(method="restyle", label="GLOBAL VIEW", args=[{"visible": [True] * trace_counter}])]
         for target_sector in CATEGORIZED_TICKERS.keys():
             visibility = []
             for sector, assets in CATEGORIZED_TICKERS.items():
                 for _ in assets:
                     val = (sector == target_sector)
-                    visibility.extend([val, val, val]) # Traces: Price, Forecast, RSI
+                    visibility.extend([val, val, val]) 
             buttons.append(dict(method="restyle", label=target_sector.upper(), args=[{"visible": visibility}]))
 
         fig.update_layout(
             template="plotly_dark", height=850, margin=dict(t=180, b=50, l=60, r=60),
             paper_bgcolor="#0a0a0a", plot_bgcolor="#0a0a0a",
-            title_text="GLOBAL QUANT TERMINAL V3.17", title_x=0.5, title_y=0.98,
+            title_text="GLOBAL QUANT TERMINAL V3.17.1", title_x=0.5, title_y=0.98,
             hovermode="x unified",
             legend=dict(itemclick="toggleothers", itemdoubleclick="toggle", font=dict(size=10, color="white"), orientation="v", x=1.02, y=0.5),
             updatemenus=[dict(
@@ -167,12 +173,12 @@ def get_dashboard():
             )]
         )
 
-        # 3. CSS & TABLE (Untouched alignment and logic)
+        # 3. CSS & TABLE
         custom_css = """
         <style>
             rect.updatemenu-item-rect { fill: #1e293b !important; stroke: #334155 !important; }
             rect.updatemenu-item-rect:hover { fill: #334155 !important; }
-            rect.updatemenu-item-rect[fill="#F4F4F4"], rect.updatemenu-item-rect[fill="#f4f4f4"], rect.updatemenu-item-rect.active { fill: #2563eb !important; }
+            rect.updatemenu-item-rect[fill="#F4F4F4"], rect.updatemenu-item-rect.active { fill: #2563eb !important; }
             text.updatemenu-item-text { fill: #ffffff !important; font-weight: bold !important; pointer-events: none !important; }
             table { width: 100%; border-collapse: collapse; table-layout: fixed; margin-top: 20px; color: white; }
             th { padding: 15px; text-align: left; background-color: #111827; color: #94a3b8; border-bottom: 2px solid #1f2937; }
