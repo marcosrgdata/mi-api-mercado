@@ -101,7 +101,6 @@ def get_dashboard():
                     market_data.append({"Asset": name, "Sector": sector, "Price": round(current_p, 2), "Perf": round(perf, 2), "RSI": rsi})
                     color = sector_colors[sector]
                     
-                    # PERFORMANCE TRACE
                     fig.add_trace(go.Scatter(
                         x=hist.index, y=((hist['Close']/start_p)-1)*100, 
                         name=name, legendgroup=name,
@@ -109,7 +108,6 @@ def get_dashboard():
                         hovertemplate='<b>'+name+'</b>: %{y:.2f}%<extra></extra>'
                     ), row=1, col=1)
                     
-                    # RSI TRACE
                     delta = hist['Close'].diff()
                     gain = delta.where(delta > 0, 0).rolling(14).mean()
                     loss = -delta.where(delta < 0, 0).rolling(14).mean()
@@ -134,7 +132,7 @@ def get_dashboard():
         fig.update_layout(
             template="plotly_dark", height=850, margin=dict(t=180, b=50, l=60, r=60),
             paper_bgcolor="#0a0a0a", plot_bgcolor="#0a0a0a",
-            title_text="GLOBAL QUANT TERMINAL V3.15", title_x=0.5, title_y=0.98,
+            title_text="GLOBAL QUANT TERMINAL V3.16", title_x=0.5, title_y=0.98,
             hovermode="x unified",
             legend=dict(itemclick="toggleothers", itemdoubleclick="toggle", font=dict(size=10, color="white"), orientation="v", x=1.02, y=0.5),
             updatemenus=[dict(
@@ -144,7 +142,39 @@ def get_dashboard():
             )]
         )
 
-        # 3. TABLE & REINFORCED CSS
+        # 3. REINFORCED CSS HACK
+        custom_css = """
+        <style>
+            /* Default state for all buttons */
+            rect.updatemenu-item-rect {
+                fill: #1e293b !important;
+                stroke: #334155 !important;
+            }
+            /* Hover state */
+            rect.updatemenu-item-rect:hover {
+                fill: #334155 !important;
+            }
+            /* ACTIVE state fix: Lock the background to Blue and prevent white eclipse */
+            /* We target both the class and the fill attribute that Plotly tries to inject */
+            rect.updatemenu-item-rect[fill="#F4F4F4"], 
+            rect.updatemenu-item-rect[fill="#f4f4f4"],
+            rect.updatemenu-item-rect.active {
+                fill: #2563eb !important; /* Professional Royal Blue */
+            }
+            /* Force text to be white and ignore mouse events always */
+            text.updatemenu-item-text {
+                fill: #ffffff !important;
+                font-weight: bold !important;
+                pointer-events: none !important;
+            }
+            /* Table Styling */
+            table { width: 100%; border-collapse: collapse; table-layout: fixed; margin-top: 20px; color: white; }
+            th { padding: 15px; text-align: left; background-color: #111827; color: #94a3b8; border-bottom: 2px solid #1f2937; }
+            tr { border-bottom: 1px solid #1f2937; }
+        </style>
+        """
+
+        # Table Logic
         df_market = pd.DataFrame(market_data).sort_values(by="Perf", ascending=False)
         table_rows = "".join([f"""
             <tr>
@@ -155,26 +185,6 @@ def get_dashboard():
                 <td style="padding: 12px; text-align: left;">{r['RSI']}</td>
             </tr>""" for _, r in df_market.iterrows()])
 
-        # CSS HACK: Using pointer-events to prevent text interaction from causing "eclipse"
-        custom_css = """
-        <style>
-            /* Hover logic: target the rectangle directly */
-            rect.updatemenu-item-rect:hover { fill: #334155 !important; }
-            /* Active state logic */
-            rect.updatemenu-item-rect.active { fill: #3b82f6 !important; }
-            /* FORCE text to be always visible and ignore mouse events */
-            text.updatemenu-item-text { 
-                fill: #ffffff !important; 
-                font-weight: bold !important; 
-                pointer-events: none !important; 
-            }
-            /* Table formatting */
-            table { width: 100%; border-collapse: collapse; table-layout: fixed; margin-top: 20px; color: white; }
-            th { padding: 15px; text-align: left; background-color: #111827; color: #94a3b8; border-bottom: 2px solid #1f2937; }
-            tr { border-bottom: 1px solid #1f2937; }
-        </style>
-        """
-
         table_html = f"""
         <div style="background-color: #0a0a0a; padding: 40px; font-family: sans-serif;">
             <h2 style="text-align: center; color: #64748b; letter-spacing: 2px;">MARKET INTELLIGENCE SUMMARY</h2>
@@ -184,8 +194,7 @@ def get_dashboard():
             </table>
         </div>"""
         
-        chart_html = fig.to_html(full_html=False, include_plotlyjs='cdn')
-        return HTMLResponse(content=f"<html><head>{custom_css}</head><body style='margin:0; background:#0a0a0a;'>{chart_html}{table_html}</body></html>")
+        return HTMLResponse(content=f"<html><head>{custom_css}</head><body style='margin:0; background:#0a0a0a;'>{fig.to_html(full_html=False, include_plotlyjs='cdn')}{table_html}</body></html>")
     
     except Exception as e:
         return HTMLResponse(content=f"<html><body style='background:#111; color:white; padding:20px;'><h1>Dashboard Error</h1><code>{str(e)}</code></body></html>", status_code=500)
