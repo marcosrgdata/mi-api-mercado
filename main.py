@@ -73,7 +73,7 @@ threading.Thread(target=background_worker, daemon=True).start()
 @app.get("/visual-dashboard", response_class=HTMLResponse)
 def get_dashboard():
     try:
-        # 1. PARALLEL DATA FETCH
+        # 1. FETCH DATA (BULK)
         ticker_ids = list(ALL_TICKERS.values())
         raw_data = yf.download(ticker_ids, period="7d", interval="1h", group_by='ticker', threads=True)
         
@@ -104,7 +104,8 @@ def get_dashboard():
                     # PERFORMANCE TRACE
                     fig.add_trace(go.Scatter(
                         x=hist.index, y=((hist['Close']/start_p)-1)*100, 
-                        name=name, legendgroup=sector,
+                        name=name, 
+                        legendgroup=name, # GROUP BY ASSET NAME FOR INDIVIDUAL ISOLATION
                         line=dict(color=color, width=2),
                         hovertemplate='<b>'+name+'</b>: %{y:.2f}%<extra></extra>'
                     ), row=1, col=1)
@@ -116,14 +117,16 @@ def get_dashboard():
                     rsi_line = 100 - (100 / (1 + (gain/(loss + 1e-9))))
                     
                     fig.add_trace(go.Scatter(
-                        x=hist.index, y=rsi_line, showlegend=False,
-                        legendgroup=sector, line=dict(color=color, width=1, dash='dot'),
+                        x=hist.index, y=rsi_line, 
+                        showlegend=False,
+                        legendgroup=name, # LINKED TO PRICE TRACE
+                        line=dict(color=color, width=1, dash='dot'),
                         opacity=0.3
                     ), row=2, col=1)
                     trace_counter += 2
                 except: continue
 
-        # 2. UPDATED BUTTONS (NO WHITE BACKGROUND)
+        # 2. BUTTONS CONFIG (SECTOR FILTERING)
         buttons = [dict(method="restyle", label="GLOBAL VIEW", args=[{"visible": [True] * trace_counter}])]
         for target_sector in CATEGORIZED_TICKERS.keys():
             visibility = []
@@ -136,57 +139,55 @@ def get_dashboard():
         fig.update_layout(
             template="plotly_dark", height=850, margin=dict(t=180, b=50, l=60, r=60),
             paper_bgcolor="#0a0a0a", plot_bgcolor="#0a0a0a",
-            title_text="GLOBAL QUANT TERMINAL V3.12", title_x=0.5, title_y=0.98,
+            title_text="GLOBAL QUANT TERMINAL V3.14", title_x=0.5, title_y=0.98,
             hovermode="x unified",
             legend=dict(
-                itemclick="toggleothers", # ONE CLICK ISOLATES ASSET
-                itemdoubleclick="toggle",  # DOUBLE CLICK TOGGLES BACK
+                itemclick="toggleothers", # ONE CLICK ISOLATES ASSET (PRICE + RSI)
+                itemdoubleclick="toggle", # DOUBLE CLICK BRINGS ALL BACK
                 font=dict(size=10, color="white"), 
                 orientation="v", x=1.02, y=0.5
             ),
             updatemenus=[dict(
                 type="buttons", direction="right", x=0.5, y=1.22, xanchor="center",
-                buttons=buttons, 
-                bgcolor="#1f2937", 
-                font=dict(color="#ffffff", size=11), 
-                active=-1, # PREVENTS BUTTON STICKING WHITE
-                bordercolor="#374151"
+                buttons=buttons, bgcolor="#1e293b", font=dict(color="#ffffff", size=11),
+                active=-1, bordercolor="#334155"
             )]
         )
 
-        # 3. FIXED TABLE (STRICT ALIGNMENT)
+        # 3. TABLE & CUSTOM CSS
         df_market = pd.DataFrame(market_data).sort_values(by="Perf", ascending=False)
-        table_rows = ""
-        for _, row in df_market.iterrows():
-            p_color = "#10b981" if row['Perf'] > 0 else "#ef4444"
-            table_rows += f"""
-                <tr style="border-bottom: 1px solid #1f2937; text-align: left;">
-                    <td style="padding: 12px; font-weight: bold; text-align: left;">{row['Asset']}</td>
-                    <td style="padding: 12px; color: #4b5563; text-align: left;">{row['Sector']}</td>
-                    <td style="padding: 12px; font-family: monospace; text-align: left;">{row['Price']}</td>
-                    <td style="padding: 12px; color: {p_color}; font-weight: bold; text-align: left;">{row['Perf']}%</td>
-                    <td style="padding: 12px; text-align: left;">{row['RSI']}</td>
-                </tr>"""
+        table_rows = "".join([f"""
+            <tr>
+                <td style="padding: 12px; font-weight: bold; text-align: left;">{r['Asset']}</td>
+                <td style="padding: 12px; color: #4b5563; text-align: left;">{r['Sector']}</td>
+                <td style="padding: 12px; font-family: monospace; text-align: left;">{r['Price']}</td>
+                <td style="padding: 12px; color: {'#10b981' if r['Perf'] > 0 else '#ef4444'}; font-weight: bold; text-align: left;">{r['Perf']}%</td>
+                <td style="padding: 12px; text-align: left;">{r['RSI']}</td>
+            </tr>""" for _, r in df_market.iterrows()])
+
+        custom_css = """
+        <style>
+            rect.updatemenu-item-rect:hover { fill: #334155 !important; }
+            rect.updatemenu-item-rect.active { fill: #3b82f6 !important; }
+            text.updatemenu-item-text { fill: #ffffff !important; font-weight: bold !important; }
+            table { width: 100%; border-collapse: collapse; table-layout: fixed; margin-top: 20px; color: white; }
+            th { padding: 15px; text-align: left; background-color: #111827; color: #94a3b8; border-bottom: 2px solid #1f2937; }
+            tr { border-bottom: 1px solid #1f2937; }
+        </style>
+        """
 
         table_html = f"""
-        <div style="background-color: #0a0a0a; color: white; font-family: sans-serif; padding: 40px;">
+        <div style="background-color: #0a0a0a; padding: 40px; font-family: sans-serif;">
             <h2 style="text-align: center; color: #64748b; letter-spacing: 2px;">MARKET INTELLIGENCE SUMMARY</h2>
-            <table style="width: 100%; border-collapse: collapse; table-layout: fixed; margin-top: 20px;">
+            <table>
                 <thead>
-                    <tr style="background-color: #111827; color: #94a3b8; border-bottom: 2px solid #1f2937;">
-                        <th style="padding: 15px; width: 25%; text-align: left;">ASSET</th>
-                        <th style="padding: 15px; width: 20%; text-align: left;">SECTOR</th>
-                        <th style="padding: 15px; width: 20%; text-align: left;">PRICE</th>
-                        <th style="padding: 15px; width: 20%; text-align: left;">7D PERF</th>
-                        <th style="padding: 15px; width: 15%; text-align: left;">RSI</th>
-                    </tr>
+                    <tr><th>ASSET</th><th>SECTOR</th><th>PRICE</th><th>7D PERF</th><th>RSI</th></tr>
                 </thead>
                 <tbody>{table_rows}</tbody>
             </table>
         </div>"""
         
-        chart_html = fig.to_html(full_html=False, include_plotlyjs='cdn')
-        return HTMLResponse(content=f"<html><head><style>.updatemenu-button:active {{ background-color: #1f2937 !important; }}</style></head><body style='margin:0; background:#0a0a0a;'>{chart_html}{table_html}</body></html>")
+        return HTMLResponse(content=f"<html><head>{custom_css}</head><body style='margin:0; background:#0a0a0a;'>{fig.to_html(full_html=False, include_plotlyjs='cdn')}{table_html}</body></html>")
     
     except Exception as e:
         return HTMLResponse(content=f"<html><body style='background:#111; color:white; padding:20px;'><h1>Dashboard Error</h1><code>{str(e)}</code></body></html>", status_code=500)
