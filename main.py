@@ -31,109 +31,126 @@ CATEGORIZED_TICKERS = {
 }
 ALL_TICKERS = {k: v for cat in CATEGORIZED_TICKERS.values() for k, v in cat.items()}
 
-# --- V4.5 ADAPTIVE ENGINE ---
+# --- V4.6 QUANT ENGINE ---
 
-def get_pro_prediction(df, hours_ahead=24):
-    df = df.copy()
-    df['hour'] = df.index.hour
-    df['day'] = df.index.dayofweek
-    # Robust Volume/Momentum check
-    df['vol_feat'] = df['Volume'].pct_change().replace([np.inf, -np.inf], 0).fillna(0)
-    if df['vol_feat'].sum() == 0: # If no volume data, use price momentum
-        df['vol_feat'] = df['Close'].pct_change().fillna(0)
+def get_quant_prediction(df, hours_ahead=24):
+    """Hybrid AI: Random Forest + Mean Reverting Stochastic Noise."""
+    data = df.copy()
+    data['h'] = data.index.hour
+    data['d'] = data.index.dayofweek
+    data['ret'] = data['Close'].pct_change().fillna(0)
     
-    delta = df['Close'].diff()
-    gain = delta.where(delta > 0, 0).rolling(14).mean()
-    loss = -delta.where(delta < 0, 0).rolling(14).mean()
-    df['rsi'] = 100 - (100 / (1 + (gain/(loss + 1e-9))))
-    df = df.fillna(method='bfill').dropna()
+    # Features for the AI
+    X = data[['h', 'd', 'ret']].values
+    y = data['Close'].values
     
-    X = df[['hour', 'day', 'vol_feat', 'rsi']].values
-    y = df['Close'].values
-    
-    # Fast RF for Railway stability
-    model = RandomForestRegressor(n_estimators=100, max_depth=7, random_state=42)
+    # Train AI
+    model = RandomForestRegressor(n_estimators=100, max_depth=6, random_state=42)
     model.fit(X, y)
     
-    last_val = df['Close'].iloc[-1]
-    volat = df['Close'].diff().std() * 0.9
+    last_p = y[-1]
+    volat = data['Close'].diff().std()
+    avg_p = data['Close'].tail(50).mean() # For mean reversion
     
     preds = []
-    temp_val = last_val
+    curr = last_p
     for i in range(1, hours_ahead + 1):
-        ai_base = model.predict([[ (df.index[-1].hour + i)%24, df.index[-1].dayofweek, df['vol_feat'].iloc[-1], df['rsi'].iloc[-1] ]])[0]
+        # AI Logic
+        ai_dir = model.predict([[ (data.index[-1].hour + i)%24, data.index[-1].dayofweek, data['ret'].iloc[-1] ]])[0]
+        
+        # Stochastic Noise + Mean Reversion (Force price to stay realistic)
         noise = np.random.normal(0, volat)
-        temp_val = (ai_base * 0.45) + (temp_val * 0.55) + noise
-        preds.append(temp_val)
+        elasticity = (avg_p - curr) * 0.05 # Pulls price back to average
+        
+        curr = (ai_dir * 0.3) + (curr * 0.7) + noise + elasticity
+        # Smooth transition damping
+        preds.append(last_p + (curr - last_p) * (0.96 ** i))
+        
     return preds
+
+# --- BACKGROUND WORKER ---
+def background_worker():
+    while True:
+        for name, tid in ALL_TICKERS.items():
+            try:
+                t = yf.Ticker(tid); h = t.history(period="5d")
+                if not h.empty and supabase:
+                    lp = round(h['Close'].iloc[-1], 2)
+                    # Institutional Trend logic
+                    ma = h['Close'].tail(20).mean()
+                    tr = "BULLISH" if lp > ma else "BEARISH"
+                    supabase.table("precios_historicos").insert({"activo": name, "precio": lp, "tendencia": tr}).execute()
+                time.sleep(1.2)
+            except: continue
+        time.sleep(900)
+
+threading.Thread(target=background_worker, daemon=True).start()
 
 # --- DASHBOARD ---
 @app.get("/visual-dashboard", response_class=HTMLResponse)
 def get_dashboard():
     try:
         ticker_ids = list(ALL_TICKERS.values())
-        # We fetch 14d but handle cases with less data
         raw_data = yf.download(ticker_ids, period="14d", interval="1h", group_by='ticker', threads=True)
         
         market_data = []
         fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.08, row_heights=[0.7, 0.3],
-                            subplot_titles=("V4.5 ADAPTIVE ML TERMINAL", "MOMENTUM (RSI 14)"))
+                            subplot_titles=("V4.6 PRO QUANT TERMINAL", "MOMENTUM (RSI 14)"))
         
-        sector_colors = {"Energy": "#ef4444", "Metals": "#f59e0b", "Agriculture": "#10b981", "Macro_Crypto": "#3b82f6"}
-        trace_counter = 0
+        colors = {"Energy": "#ef4444", "Metals": "#f59e0b", "Agriculture": "#10b981", "Macro_Crypto": "#3b82f6"}
+        trace_idx = 0
 
         for sector, assets in CATEGORIZED_TICKERS.items():
             for name, tid in assets.items():
                 try:
                     hist = raw_data[tid].dropna() if len(ticker_ids) > 1 else raw_data.dropna()
-                    if hist.empty or len(hist) < 15: continue # Relaxed threshold
+                    if len(hist) < 12: continue # LOWERED THRESHOLD: More assets will show up
                     
-                    start_p = hist['Close'].iloc[0]
-                    perf_series = ((hist['Close'] / start_p) - 1) * 100
-                    color = sector_colors[sector]
+                    base_p = hist['Close'].iloc[0]
+                    perf = ((hist['Close'] / base_p) - 1) * 100
                     
-                    # 1. Real
-                    fig.add_trace(go.Scatter(x=hist.index, y=perf_series, name=name, legendgroup=name, line=dict(color=color, width=2.5)), row=1, col=1)
+                    # 1. Real Trace
+                    fig.add_trace(go.Scatter(x=hist.index, y=perf, name=name, legendgroup=name, line=dict(color=colors[sector], width=2.5)), row=1, col=1)
                     
-                    # 2. Prediction
-                    proj_y = get_pro_prediction(hist)
-                    proj_perf = [((v / start_p) - 1) * 100 for v in proj_y]
+                    # 2. Advanced Prediction
+                    proj_raw = get_quant_prediction(hist)
+                    proj_perf = [((v / base_p) - 1) * 100 for v in proj_raw]
                     f_idx = pd.date_range(start=hist.index[-1], periods=25, freq='h')[1:]
-                    fig.add_trace(go.Scatter(x=[hist.index[-1]] + list(f_idx), y=[perf_series.iloc[-1]] + list(proj_perf),
+                    
+                    fig.add_trace(go.Scatter(x=[hist.index[-1]] + list(f_idx), y=[perf.iloc[-1]] + list(proj_perf),
                                              name=f"{name} Forecast", legendgroup=name, showlegend=False,
-                                             line=dict(color=color, width=2, dash='dot'), opacity=0.35), row=1, col=1)
+                                             line=dict(color=colors[sector], width=2, dash='dot'), opacity=0.4), row=1, col=1)
                     
                     # 3. RSI
-                    delta = hist['Close'].diff(); g = delta.where(delta > 0, 0).rolling(14).mean(); l = -delta.where(delta < 0, 0).rolling(14).mean()
-                    rsi_line = 100 - (100 / (1 + (g/(l + 1e-9))))
-                    fig.add_trace(go.Scatter(x=hist.index, y=rsi_line, showlegend=False, legendgroup=name, line=dict(color=color, width=1, dash='dot'), opacity=0.2), row=2, col=1)
+                    d = hist['Close'].diff(); g = d.where(d > 0, 0).rolling(14).mean(); l = -d.where(d < 0, 0).rolling(14).mean()
+                    rsi = 100 - (100 / (1 + (g/(l + 1e-9))))
+                    fig.add_trace(go.Scatter(x=hist.index, y=rsi, showlegend=False, legendgroup=name, line=dict(color=colors[sector], width=1, dash='dot'), opacity=0.2), row=2, col=1)
 
-                    # Accuracy calculation
-                    m_dir = np.sign(perf_series.diff().tail(12).values)
-                    p_dir = np.sign(np.diff([perf_series.iloc[-1]] + list(proj_perf[:12])))
-                    acc = round((sum(m_dir == p_dir) / 12) * 100, 1) if len(m_dir) > 0 else 50.0
+                    # Quick Accuracy Check
+                    acc = round((sum(np.sign(perf.diff().tail(12).values) == np.sign(np.diff([perf.iloc[-1]] + list(proj_perf[:12])))) / 12) * 100, 1)
                     
-                    market_data.append({"Asset": name, "Sector": sector, "Price": round(hist['Close'].iloc[-1], 2), "Perf": round(perf_series.iloc[-1], 2), "Acc": acc})
-                    trace_counter += 3
+                    market_data.append({"Asset": name, "Sector": sector, "Price": round(hist['Close'].iloc[-1], 2), "Perf": round(perf.iloc[-1], 2), "Acc": acc, "Trend": "UP" if perf.iloc[-1] > perf.rolling(20).mean().iloc[-1] else "DOWN"})
+                    trace_idx += 3
                 except: continue
 
         # UI & LEGEND FIX
-        buttons = [dict(method="restyle", label="GLOBAL VIEW", args=[{"visible": [True] * trace_counter}])]
-        for target_sector in CATEGORIZED_TICKERS.keys():
-            visibility = []
-            for sector, assets in CATEGORIZED_TICKERS.items():
-                for _ in assets:
-                    v = (sector == target_sector); visibility.extend([v, v, v])
-            buttons.append(dict(method="restyle", label=target_sector.upper(), args=[{"visible": visibility}]))
+        btns = [dict(method="restyle", label="GLOBAL VIEW", args=[{"visible": [True] * trace_idx}])]
+        for s_name in CATEGORIZED_TICKERS.keys():
+            vis = []
+            for s, a in CATEGORIZED_TICKERS.items():
+                for _ in a:
+                    v = (s == s_name); vis.extend([v, v, v])
+            btns.append(dict(method="restyle", label=s_name.upper(), args=[{"visible": vis}]))
 
         fig.update_layout(template="plotly_dark", height=850, margin=dict(t=150, b=50), paper_bgcolor="#0a0a0a", plot_bgcolor="#0a0a0a",
                           legend=dict(itemclick="toggleothers", itemdoubleclick="toggle", font=dict(size=10), orientation="v", x=1.02, y=0.5),
-                          updatemenus=[dict(type="buttons", direction="right", x=0.5, y=1.18, xanchor="center", buttons=buttons, bgcolor="#1e293b", font=dict(color="white"), active=-1)])
+                          updatemenus=[dict(type="buttons", direction="right", x=0.5, y=1.18, xanchor="center", buttons=btns, bgcolor="#1e293b", font=dict(color="white"), active=-1)])
 
-        custom_css = "<style>rect.updatemenu-item-rect { fill: #1e293b !important; } rect.updatemenu-item-rect:hover { fill: #334155 !important; } rect.updatemenu-item-rect.active, rect.updatemenu-item-rect[fill='#F4F4F4'] { fill: #2563eb !important; } text.updatemenu-item-text { fill: #ffffff !important; font-weight: bold !important; pointer-events: none !important; } table { width: 100%; border-collapse: collapse; color: white; table-layout: fixed; } th { padding: 15px; text-align: left; background-color: #111827; color: #94a3b8; } tr { border-bottom: 1px solid #1f2937; }</style>"
-        df_market = pd.DataFrame(market_data).sort_values(by="Perf", ascending=False)
-        table_rows = "".join([f"<tr><td style='padding:12px; font-weight:bold; text-align:left;'>{r['Asset']}</td><td style='padding:12px; color:#4b5563;'>{r['Sector']}</td><td style='padding:12px;'>{r['Price']}</td><td style='padding:12px; color:{'#10b981' if r['Perf']>0 else '#ef4444'}; font-weight:bold;'>{r['Perf']}%</td><td style='padding:12px; color:#3b82f6; font-weight:bold;'>{r['Acc']}%</td></tr>" for _, r in df_market.iterrows()])
+        # CSS & TABLE
+        css = "<style>rect.updatemenu-item-rect { fill: #1e293b !important; } rect.updatemenu-item-rect:hover { fill: #334155 !important; } rect.updatemenu-item-rect.active, rect.updatemenu-item-rect[fill='#F4F4F4'] { fill: #2563eb !important; } text.updatemenu-item-text { fill: #ffffff !important; font-weight: bold !important; pointer-events: none !important; } table { width: 100%; border-collapse: collapse; color: white; table-layout: fixed; } th { padding: 15px; text-align: left; background-color: #111827; color: #94a3b8; } tr { border-bottom: 1px solid #1f2937; }</style>"
+        df_m = pd.DataFrame(market_data).sort_values(by="Perf", ascending=False)
+        rows = "".join([f"<tr><td style='padding:12px; font-weight:bold; text-align:left;'>{r['Asset']}</td><td style='color:#4b5563;'>{r['Sector']}</td><td>{r['Price']}</td><td style='color:{'#10b981' if r['Perf']>0 else '#ef4444'}; font-weight:bold;'>{r['Perf']}%</td><td style='color:#3b82f6;'>{r['Acc']}%</td><td>{r['Trend']}</td></tr>" for _, r in df_m.iterrows()])
         
-        return HTMLResponse(content=f"<html><head>{custom_css}</head><body style='margin:0; background:#0a0a0a;'>{fig.to_html(full_html=False, include_plotlyjs='cdn')}<div style='background:#0a0a0a; padding:40px; font-family:sans-serif;'><h2 style='text-align:center; color:#64748b; letter-spacing: 2px;'>V4.5 INSTITUTIONAL SUMMARY</h2><table><thead><tr><th>ASSET</th><th>SECTOR</th><th>PRICE</th><th>7D PERF</th><th>ML ACCURACY</th></tr></thead><tbody>{table_rows}</tbody></table></div></body></html>")
+        return HTMLResponse(content=f"<html><head>{css}</head><body style='margin:0; background:#0a0a0a;'>{fig.to_html(full_html=False, include_plotlyjs='cdn')}<div style='background:#0a0a0a; padding:40px; font-family:sans-serif;'><h2 style='text-align:center; color:#64748b; letter-spacing: 2px;'>V4.6 INSTITUTIONAL SUMMARY</h2><table><thead><tr><th>ASSET</th><th>SECTOR</th><th>PRICE</th><th>7D PERF</th><th>ACCURACY</th><th>TREND</th></tr></thead><tbody>{rows}</tbody></table></div></body></html>")
     except Exception as e:
         return HTMLResponse(content=f"<h1>Error</h1><code>{str(e)}</code>", status_code=500)
