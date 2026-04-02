@@ -3,6 +3,7 @@ from fastapi.responses import HTMLResponse
 import yfinance as yf
 import pandas as pd
 from supabase import create_client, Client
+from sklearn.linear_model import LinearRegression
 import numpy as np
 import os
 import datetime
@@ -43,15 +44,20 @@ CATEGORIZED_TICKERS = {
 
 ALL_TICKERS = {k: v for cat in CATEGORIZED_TICKERS.values() for k, v in cat.items()}
 
-# --- QUANT ENGINE ---
-def calculate_rsi(prices, period=14):
-    if len(prices) < period: return 50
-    delta = prices.diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
-    rs = gain / (loss + 1e-9)
-    rsi = 100 - (100 / (1 + rs))
-    return round(rsi.iloc[-1], 2)
+# --- QUANT & PREDICTION ENGINE ---
+def get_projection(data_series, hours_ahead=24):
+    """Calculates a linear projection for the next N hours."""
+    y = data_series.values.reshape(-1, 1)
+    X = np.arange(len(y)).reshape(-1, 1)
+    
+    model = LinearRegression()
+    model.fit(X, y)
+    
+    # Predict future points
+    future_X = np.arange(len(y), len(y) + hours_ahead).reshape(-1, 1)
+    future_y = model.predict(future_X)
+    
+    return future_y.flatten()
 
 # --- BACKGROUND WORKER ---
 def background_worker():
@@ -73,7 +79,7 @@ threading.Thread(target=background_worker, daemon=True).start()
 @app.get("/visual-dashboard", response_class=HTMLResponse)
 def get_dashboard():
     try:
-        # 1. PARALLEL DATA FETCH
+        # 1. BULK DATA FETCH
         ticker_ids = list(ALL_TICKERS.values())
         raw_data = yf.download(ticker_ids, period="7d", interval="1h", group_by='ticker', threads=True)
         
@@ -81,7 +87,7 @@ def get_dashboard():
         fig = make_subplots(
             rows=2, cols=1, shared_xaxes=True, 
             vertical_spacing=0.12, row_heights=[0.65, 0.35],
-            subplot_titles=("RELATIVE PERFORMANCE (%)", "MOMENTUM INDEX (RSI 14)")
+            subplot_titles=("RELATIVE PERFORMANCE & AI PROJECTION", "MOMENTUM INDEX (RSI 14)")
         )
         
         sector_colors = {"Energy": "#ef4444", "Metals": "#f59e0b", "Agriculture": "#10b981", "Macro_Crypto": "#3b82f6"}
@@ -91,108 +97,92 @@ def get_dashboard():
             for name, tid in assets.items():
                 try:
                     hist = raw_data[tid].dropna() if len(ticker_ids) > 1 else raw_data.dropna()
-                    if hist.empty or len(hist) < 2: continue
+                    if hist.empty or len(hist) < 10: continue
                     
                     start_p = hist['Close'].iloc[0]
                     current_p = hist['Close'].iloc[-1]
-                    perf = ((current_p / start_p) - 1) * 100
-                    rsi = calculate_rsi(hist['Close'])
-                    
-                    market_data.append({"Asset": name, "Sector": sector, "Price": round(current_p, 2), "Perf": round(perf, 2), "RSI": rsi})
+                    perf_series = ((hist['Close'] / start_p) - 1) * 100
                     color = sector_colors[sector]
                     
+                    # --- A. HISTORICAL TRACE ---
                     fig.add_trace(go.Scatter(
-                        x=hist.index, y=((hist['Close']/start_p)-1)*100, 
+                        x=hist.index, y=perf_series, 
                         name=name, legendgroup=name,
-                        line=dict(color=color, width=2),
+                        line=dict(color=color, width=2.5),
                         hovertemplate='<b>'+name+'</b>: %{y:.2f}%<extra></extra>'
                     ), row=1, col=1)
                     
+                    # --- B. AI PROJECTION TRACE (The new faint line) ---
+                    projection_y = get_projection(perf_series, hours_ahead=24)
+                    # Create future timestamps starting from the last known date
+                    future_index = pd.date_range(start=hist.index[-1], periods=25, freq='H')[1:]
+                    
+                    # We prepend the last real value to the projection for visual continuity
+                    proj_x = [hist.index[-1]] + list(future_index)
+                    proj_y = [perf_series.iloc[-1]] + list(projection_y)
+                    
+                    fig.add_trace(go.Scatter(
+                        x=proj_x, y=proj_y,
+                        name=f"{name} Forecast",
+                        legendgroup=name, showlegend=False,
+                        line=dict(color=color, width=2, dash='dot'),
+                        opacity=0.35, # Faint line
+                        hovertemplate='<b>'+name+' Forecast</b>: %{y:.2f}%<extra></extra>'
+                    ), row=1, col=1)
+
+                    # --- C. RSI TRACE ---
                     delta = hist['Close'].diff()
                     gain = delta.where(delta > 0, 0).rolling(14).mean()
                     loss = -delta.where(delta < 0, 0).rolling(14).mean()
                     rsi_line = 100 - (100 / (1 + (gain/(loss + 1e-9))))
+                    
                     fig.add_trace(go.Scatter(
                         x=hist.index, y=rsi_line, showlegend=False,
-                        legendgroup=name, line=dict(color=color, width=1, dash='dot'), opacity=0.3
+                        legendgroup=name, line=dict(color=color, width=1, dash='dot'), opacity=0.2
                     ), row=2, col=1)
-                    trace_counter += 2
+                    
+                    market_data.append({"Asset": name, "Sector": sector, "Price": round(current_p, 2), "Perf": round(perf_series.iloc[-1], 2)})
+                    trace_counter += 3 # Three traces: Price, Forecast, RSI
                 except: continue
 
-        # 2. BUTTONS CONFIG
+        # 2. BUTTONS & UI
         buttons = [dict(method="restyle", label="GLOBAL VIEW", args=[{"visible": [True] * trace_counter}])]
         for target_sector in CATEGORIZED_TICKERS.keys():
             visibility = []
             for sector, assets in CATEGORIZED_TICKERS.items():
                 for _ in assets:
                     val = (sector == target_sector)
-                    visibility.extend([val, val])
+                    visibility.extend([val, val, val]) # Triplet for Price, Forecast, RSI
             buttons.append(dict(method="restyle", label=target_sector.upper(), args=[{"visible": visibility}]))
 
         fig.update_layout(
             template="plotly_dark", height=850, margin=dict(t=180, b=50, l=60, r=60),
             paper_bgcolor="#0a0a0a", plot_bgcolor="#0a0a0a",
-            title_text="GLOBAL QUANT TERMINAL V3.16", title_x=0.5, title_y=0.98,
-            hovermode="x unified",
-            legend=dict(itemclick="toggleothers", itemdoubleclick="toggle", font=dict(size=10, color="white"), orientation="v", x=1.02, y=0.5),
+            title_text="GLOBAL QUANT PREDICTIVE TERMINAL V3.17", title_x=0.5, title_y=0.98,
+            legend=dict(itemclick="toggleothers", itemdoubleclick="toggle", font=dict(size=10), orientation="v", x=1.02, y=0.5),
             updatemenus=[dict(
                 type="buttons", direction="right", x=0.5, y=1.22, xanchor="center",
-                buttons=buttons, bgcolor="#1e293b", font=dict(color="#ffffff", size=11), 
-                active=-1, bordercolor="#334155"
+                buttons=buttons, bgcolor="#1e293b", font=dict(color="#ffffff", size=11), bordercolor="#334155"
             )]
         )
 
-        # 3. REINFORCED CSS HACK
+        # 3. CSS & TABLE
         custom_css = """
         <style>
-            /* Default state for all buttons */
-            rect.updatemenu-item-rect {
-                fill: #1e293b !important;
-                stroke: #334155 !important;
-            }
-            /* Hover state */
-            rect.updatemenu-item-rect:hover {
-                fill: #334155 !important;
-            }
-            /* ACTIVE state fix: Lock the background to Blue and prevent white eclipse */
-            /* We target both the class and the fill attribute that Plotly tries to inject */
-            rect.updatemenu-item-rect[fill="#F4F4F4"], 
-            rect.updatemenu-item-rect[fill="#f4f4f4"],
-            rect.updatemenu-item-rect.active {
-                fill: #2563eb !important; /* Professional Royal Blue */
-            }
-            /* Force text to be white and ignore mouse events always */
-            text.updatemenu-item-text {
-                fill: #ffffff !important;
-                font-weight: bold !important;
-                pointer-events: none !important;
-            }
-            /* Table Styling */
-            table { width: 100%; border-collapse: collapse; table-layout: fixed; margin-top: 20px; color: white; }
+            rect.updatemenu-item-rect { fill: #1e293b !important; }
+            rect.updatemenu-item-rect:hover { fill: #334155 !important; }
+            rect.updatemenu-item-rect[fill="#F4F4F4"], rect.updatemenu-item-rect.active { fill: #2563eb !important; }
+            text.updatemenu-item-text { fill: #ffffff !important; font-weight: bold !important; pointer-events: none !important; }
+            table { width: 100%; border-collapse: collapse; margin-top: 20px; color: white; }
             th { padding: 15px; text-align: left; background-color: #111827; color: #94a3b8; border-bottom: 2px solid #1f2937; }
             tr { border-bottom: 1px solid #1f2937; }
         </style>
         """
-
-        # Table Logic
-        df_market = pd.DataFrame(market_data).sort_values(by="Perf", ascending=False)
-        table_rows = "".join([f"""
-            <tr>
-                <td style="padding: 12px; font-weight: bold; text-align: left;">{r['Asset']}</td>
-                <td style="padding: 12px; color: #4b5563; text-align: left;">{r['Sector']}</td>
-                <td style="padding: 12px; font-family: monospace; text-align: left;">{r['Price']}</td>
-                <td style="padding: 12px; color: {'#10b981' if r['Perf'] > 0 else '#ef4444'}; font-weight: bold; text-align: left;">{r['Perf']}%</td>
-                <td style="padding: 12px; text-align: left;">{r['RSI']}</td>
-            </tr>""" for _, r in df_market.iterrows()])
-
-        table_html = f"""
-        <div style="background-color: #0a0a0a; padding: 40px; font-family: sans-serif;">
-            <h2 style="text-align: center; color: #64748b; letter-spacing: 2px;">MARKET INTELLIGENCE SUMMARY</h2>
-            <table>
-                <thead><tr><th>ASSET</th><th>SECTOR</th><th>PRICE</th><th>7D PERF</th><th>RSI</th></tr></thead>
-                <tbody>{table_rows}</tbody>
-            </table>
-        </div>"""
+        table_html = f"<div style='background:#0a0a0a; padding:40px; font-family:sans-serif;'><h2 style='text-align:center; color:#64748b;'>MARKET SUMMARY</h2><table><thead><tr><th>ASSET</th><th>SECTOR</th><th>PRICE</th><th>7D PERF</th></tr></thead>"
+        for r in market_data:
+            c = "#10b981" if r['Perf'] > 0 else "#ef4444"
+            table_html += f"<tr><td><b>{r['Asset']}</b></td><td style='color:#4b5563;'>{r['Sector']}</td><td>{r['Price']}</td><td style='color:{c};'>{r['Perf']}%</td></tr>"
+        table_html += "</table></div>"
         
         return HTMLResponse(content=f"<html><head>{custom_css}</head><body style='margin:0; background:#0a0a0a;'>{fig.to_html(full_html=False, include_plotlyjs='cdn')}{table_html}</body></html>")
     
