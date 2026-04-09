@@ -43,7 +43,7 @@ def get_ai_prediction_v5(asset_name, prices_list):
         return client.predict(asset_name=asset_name, prices_string=p_str, api_name="/predict_v5")
     except: return None
 
-# --- WORKER V5.2 ---
+# --- WORKER V5.3 ---
 def background_worker():
     while True:
         print(f"🤖 Ciclo iniciado: {datetime.datetime.now()}", flush=True)
@@ -53,7 +53,6 @@ def background_worker():
                 df = yf.download(tid, period=p, interval="1h", progress=False)
                 df = clean_df(df).dropna()
                 if df.empty: continue
-                
                 lp = float(df['Close'].iloc[-1])
                 
                 if supabase:
@@ -73,14 +72,13 @@ def background_worker():
                         }).execute()
 
                         supabase.table("ai_prediction_logs").insert({"asset": name, "trend": ai['prediction'], "target_max": t_max, "target_min": t_min}).execute()
-                
                 time.sleep(1.5)
             except Exception as e: print(f"❌ Error {name}: {e}")
         time.sleep(900)
 
 threading.Thread(target=background_worker, daemon=True).start()
 
-# --- DASHBOARD V5.2 ---
+# --- DASHBOARD V5.3 ---
 @app.get("/visual-dashboard", response_class=HTMLResponse)
 def get_dashboard():
     try:
@@ -88,8 +86,12 @@ def get_dashboard():
         raw_data = yf.download(ticker_ids, period="14d", interval="1h", group_by='ticker', threads=False)
         
         ai_current = {item['asset']: item for item in supabase.table("ai_predictions_v5").select("*").execute().data}
-        yesterday = (datetime.datetime.now() - datetime.timedelta(hours=26)).isoformat()
-        logs_res = supabase.table("ai_prediction_logs").select("*").gt("created_at", yesterday).order("created_at").execute()
+        
+        # FIX LOGICA AYER: Buscamos datos que tengan entre 18 y 30 horas de antigüedad
+        t_limit = (datetime.datetime.now() - datetime.timedelta(hours=18)).isoformat()
+        t_start = (datetime.datetime.now() - datetime.timedelta(hours=30)).isoformat()
+        logs_res = supabase.table("ai_prediction_logs").select("*").lt("created_at", t_limit).gt("created_at", t_start).order("created_at").execute()
+        
         ai_past = {}
         for log in logs_res.data:
             if log['asset'] not in ai_past: ai_past[log['asset']] = log
@@ -104,7 +106,6 @@ def get_dashboard():
                 try:
                     hist = clean_df(raw_data[tid]).dropna()
                     if len(hist) < 24: continue
-                    
                     t7d = hist.index[-1] - pd.Timedelta(days=7); idx7 = hist.index.get_indexer([t7d], method='nearest')[0]
                     perf = round(((hist['Close'].iloc[-1] / hist['Close'].iloc[idx7]) - 1) * 100, 2)
                     
@@ -112,23 +113,25 @@ def get_dashboard():
                                                  name=name, legendgroup=name, increasing_line_color=colors[sector], decreasing_line_color='#ffffff'), row=1, col=1)
                     
                     curr, past = ai_current.get(name, {}), ai_past.get(name, {})
-                    val_text = "N/A"
+                    
+                    # Validación: Precio real de hoy vs Predicción de ayer
+                    real_h, real_l = curr.get('real_max_24h', 0), curr.get('real_min_24h', 0)
+                    val_text = "Wait 24h..."
                     if past:
-                        hit = (curr.get('real_max_24h', 0) <= past['target_max'] * 1.005) and (curr.get('real_min_24h', 0) >= past['target_min'] * 0.995)
+                        hit = (real_h <= past['target_max'] * 1.005) and (real_l >= past['target_min'] * 0.995)
                         val_text = "✅ SUCCESS" if hit else "❌ MISSED"
 
                     market_data.append({
                         "Asset": name, "Sector": sector, "Price": round(float(hist['Close'].iloc[-1]), 2), "Perf": perf,
-                        "R_H": curr.get('real_max_24h', 0), "R_L": curr.get('real_min_24h', 0),
+                        "R_H": real_h, "R_L": real_l,
                         "Trend": curr.get('trend', 'N/A'), "Conf": curr.get('confidence', '0%'),
                         "T_Max": curr.get('target_max', 0), "T_Min": curr.get('target_min', 0),
-                        "Past_Call": f"{past.get('trend', '-')}: [{past.get('target_min', 0)}-{past.get('target_max', 0)}]" if past else "-",
+                        "Past_Call": f"{past.get('trend', '-')}: [{past.get('target_min', 0)}-{past.get('target_max', 0)}]" if past else "Collecting...",
                         "Val": val_text
                     })
                     trace_idx += 2
                 except: continue
 
-        # --- UI FIX ---
         btns = [dict(method="restyle", label="GLOBAL VIEW", args=[{"visible": [True] * trace_idx}])]
         for s_name in CATEGORIZED_TICKERS.keys():
             vis = []
@@ -145,7 +148,7 @@ def get_dashboard():
             color = "#ef4444" if pos > 80 else "#10b981" if pos < 20 else "#3b82f6"
             return f'<div style="width:100%; background:#1e293b; height:6px; border-radius:3px; margin-top:8px; position:relative;"><div style="position:absolute; left:{pos}%; width:10px; height:10px; background:{color}; border-radius:50%; top:-2px; box-shadow:0 0 5px {color};"></div></div>'
 
-        css = "<style>body{background:#0a0a0a;color:white;font-family:sans-serif;}table{width:100%;border-collapse:collapse;table-layout:fixed;}th{padding:15px;text-align:left;background:#111827;color:#94a3b8;font-size:0.8em;}tr{border-bottom:1px solid #1f2937;}td{padding:12px;}.up{color:#10b981;font-weight:bold;}.down{color:#ef4444;font-weight:bold;}</style>"
+        css = "<style>body{background:#0a0a0a;color:white;font-family:sans-serif;}table{width:100%;border-collapse:collapse;table-layout:fixed;}th{padding:15px;text-align:left;background:#111827;color:#94a3b8;font-size:0.75em;}tr{border-bottom:1px solid #1f2937;}td{padding:12px;}.up{color:#10b981;font-weight:bold;}.down{color:#ef4444;font-weight:bold;}.val-box{border-left:1px solid #334155; padding-left:10px;}</style>"
         
         rows = ""
         for r in sorted(market_data, key=lambda x: x['Perf'], reverse=True):
@@ -156,10 +159,10 @@ def get_dashboard():
                 <td><b>{r['Asset']}</b><br><small style='color:#4b5563'>{r['Sector']}</small></td>
                 <td>${r['Price']}</td>
                 <td class='{pc}'>{r['Perf']}%</td>
-                <td style='color:#64748b'>Range:<br>{r['R_H']} / {r['R_L']}</td>
-                <td><span class='{tc}'>{r['Trend']} ({r['Conf']})</span><br><small>Target: {r['T_Min']} - {r['T_Max']}</small>{render_bar(r['Price'], r['T_Min'], r['T_Max'])}</td>
-                <td style='border-left: 2px solid #334155; padding-left:15px;'><small style='color:#94a3b8'>Yesterday:</small><br><small>{r['Past_Call']}</small><br><b class='{vc}'>{r['Val']}</b></td>
+                <td style='color:#64748b'><small>Real High/Low:</small><br>{r['R_H']} / {r['R_L']}</td>
+                <td><span class='{tc}'>{r['Trend']} ({r['Conf']})</span><br><small>Next 24h: {r['T_Min']} - {r['T_Max']}</small>{render_bar(r['Price'], r['T_Min'], r['T_Max'])}</td>
+                <td class="val-box"><small style='color:#94a3b8'>Yesterday's Call:</small><br><small>{r['Past_Call']}</small><br><b class='{vc}'>{r['Val']}</b></td>
             </tr>
             """
-        return HTMLResponse(content=f"<html><head>{css}</head><body>{fig.to_html(full_html=False, include_plotlyjs='cdn')}<div style='padding:40px;'><h2 style='text-align:center;color:#64748b;'>V5.2 TERMINAL</h2><table><thead><tr><th>ASSET</th><th>PRICE</th><th>7D ROLL</th><th>REAL 24H</th><th>TOMORROW TARGET</th><th>VALIDATION (24H)</th></tr></thead><tbody>{rows}</tbody></table></div></body></html>")
+        return HTMLResponse(content=f"<html><head>{css}</head><body>{fig.to_html(full_html=False, include_plotlyjs='cdn')}<div style='padding:40px;'><h2 style='text-align:center;color:#64748b;letter-spacing:2px;'>V5.3 QUANT TERMINAL</h2><table><thead><tr><th>ASSET</th><th>PRICE</th><th>7D ROLL</th><th>REAL 24H (TODAY)</th><th>AI TARGET (TOMORROW)</th><th>AI VALIDATION (YESTERDAY)</th></tr></thead><tbody>{rows}</tbody></table></div></body></html>")
     except Exception as e: return HTMLResponse(content=f"Error: {e}")
