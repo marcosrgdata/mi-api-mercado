@@ -157,9 +157,10 @@ def get_dashboard():
         """
         
         rows = ""
+        # Corregido: t_class y p_class definidos correctamente
         for r in pd.DataFrame(market_data).sort_values(by="Perf", ascending=False).to_dict('records'):
-            t_color = "up" if r['AI_Trend'] == "UP" else "down"
-            p_color = "up" if r['Perf'] > 0 else "down"
+            t_class = "up" if r['AI_Trend'] == "UP" else "down"
+            p_class = "up" if r['Perf'] > 0 else "down" # <-- Aquí estaba el error
             thermo = render_thermometer(r['Price'], r['AI_Min'], r['AI_Max'])
             
             rows += f"""
@@ -167,7 +168,7 @@ def get_dashboard():
                 <td><b>{r['Asset']}</b><br><small style='color:#475569'>{r['Sector']}</small></td>
                 <td><span style='font-size:1.1em;'>${r['Price']}</span><br><small class='{p_class}'>{r['Perf']}% (7D)</small></td>
                 <td style='color:#64748b'>MAX: ${r['Real_Max']}<br>MIN: ${r['Real_Min']}</td>
-                <td><span class='{t_color}'>{r['AI_Trend']}</span><br><small style='color:#3b82f6;'>{r['AI_Conf']}</small></td>
+                <td><span class='{t_class}'>{r['AI_Trend']}</span><br><small style='color:#3b82f6;'>{r['AI_Conf']}</small></td>
                 <td style='width:250px;'>
                     <div style='display:flex; justify-content:space-between; font-size:0.8em;'>
                         <span class='down'>L: ${r['AI_Min']}</span>
