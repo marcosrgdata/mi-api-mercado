@@ -1,28 +1,25 @@
-from fastapi import FastAPI
-from fastapi.responses import HTMLResponse
-import yfinance as yf
-import pandas as pd
-import numpy as np
 import os
+import time
 import datetime
 import threading
-import time
+import pandas as pd
+import numpy as np
+import yfinance as yf
 import plotly.graph_objects as go
+from fastapi import FastAPI
+from fastapi.responses import HTMLResponse
 from plotly.subplots import make_subplots
 from sklearn.ensemble import RandomForestRegressor
+from gradio_client import Client
+from supabase import create_client
 
 app = FastAPI()
 
 # --- CONFIGURATION ---
 URL_SB = os.getenv("URL_SB")
 KEY_SB = os.getenv("KEY_SB")
-try:
-    from supabase import create_client, Client
-    supabase: Client = create_client(URL_SB, KEY_SB)
-except:
-    supabase = None
+supabase = create_client(URL_SB, KEY_SB) if URL_SB and KEY_SB else None
 
-# --- ASSET LIST ---
 CATEGORIZED_TICKERS = {
     "Energy": {"Crude_Oil": "CL=F", "Brent_Oil": "BZ=F", "Natural_Gas": "NG=F", "Gasoline": "RB=F", "Heating_Oil": "HO=F", "Uranium": "URA"},
     "Metals": {"Copper": "HG=F", "Aluminum": "ALI=F", "Lithium": "LIT", "Steel": "SLX", "Gold": "GC=F", "Silver": "SI=F", "Platinum": "PL=F", "Palladium": "PA=F"},
@@ -31,44 +28,52 @@ CATEGORIZED_TICKERS = {
 }
 ALL_TICKERS = {k: v for cat in CATEGORIZED_TICKERS.values() for k, v in cat.items()}
 
-# --- V4.6 QUANT ENGINE ---
+# --- AI ENGINES ---
 
-def get_quant_prediction(df, hours_ahead=24):
-    """Hybrid AI: Random Forest + Mean Reverting Stochastic Noise."""
+def get_ai_prediction_v5(asset_name, prices_list):
+    """Calls the LSTM V5.0 model on Hugging Face."""
+    try:
+        if len(prices_list) < 48:
+            return None
+        # Taking only the last 48 hours
+        input_prices = prices_list[-48:]
+        client = Client("marcosrgdata/trading-brain-v5")
+        prices_string = ",".join(map(str, input_prices))
+        
+        result = client.predict(
+            asset_name=asset_name,
+            prices_string=prices_string,
+            api_name="/predict_v5"
+        )
+        return result
+    except Exception as e:
+        print(f"HF Connection Error: {e}")
+        return None
+
+def get_quant_prediction_v4(df, hours_ahead=24):
+    """Hybrid AI: Random Forest + Stochastic Noise."""
     data = df.copy()
     data['h'] = data.index.hour
     data['d'] = data.index.dayofweek
     data['ret'] = data['Close'].pct_change().fillna(0)
-    
-    # Features for the AI
     X = data[['h', 'd', 'ret']].values
     y = data['Close'].values
-    
-    # Train AI
-    model = RandomForestRegressor(n_estimators=100, max_depth=6, random_state=42)
+    model = RandomForestRegressor(n_estimators=50, max_depth=5, random_state=42)
     model.fit(X, y)
     
-    last_p = y[-1]
     volat = data['Close'].diff().std()
-    avg_p = data['Close'].tail(50).mean() # For mean reversion
-    
+    avg_p = data['Close'].tail(50).mean()
     preds = []
-    curr = last_p
+    curr = y[-1]
     for i in range(1, hours_ahead + 1):
-        # AI Logic
         ai_dir = model.predict([[ (data.index[-1].hour + i)%24, data.index[-1].dayofweek, data['ret'].iloc[-1] ]])[0]
-        
-        # Stochastic Noise + Mean Reversion (Force price to stay realistic)
-        noise = np.random.normal(0, volat)
-        elasticity = (avg_p - curr) * 0.05 # Pulls price back to average
-        
+        noise = np.random.normal(0, volat * 0.5)
+        elasticity = (avg_p - curr) * 0.05
         curr = (ai_dir * 0.3) + (curr * 0.7) + noise + elasticity
-        # Smooth transition damping
-        preds.append(last_p + (curr - last_p) * (0.96 ** i))
-        
+        preds.append(y[-1] + (curr - y[-1]) * (0.96 ** i))
     return preds
 
-# --- BACKGROUND WORKER ---
+# --- WORKER ---
 def background_worker():
     while True:
         for name, tid in ALL_TICKERS.items():
@@ -76,26 +81,25 @@ def background_worker():
                 t = yf.Ticker(tid); h = t.history(period="5d")
                 if not h.empty and supabase:
                     lp = round(h['Close'].iloc[-1], 2)
-                    # Institutional Trend logic
                     ma = h['Close'].tail(20).mean()
                     tr = "BULLISH" if lp > ma else "BEARISH"
                     supabase.table("precios_historicos").insert({"activo": name, "precio": lp, "tendencia": tr}).execute()
-                time.sleep(1.2)
+                time.sleep(1)
             except: continue
         time.sleep(900)
 
 threading.Thread(target=background_worker, daemon=True).start()
 
 # --- DASHBOARD ---
-@app.get("/visual-dashboard", response_class=HTMLResponse)
+@app.get("/", response_class=HTMLResponse)
 def get_dashboard():
     try:
         ticker_ids = list(ALL_TICKERS.values())
-        raw_data = yf.download(ticker_ids, period="14d", interval="1h", group_by='ticker', threads=True)
+        raw_data = yf.download(ticker_ids, period="14d", interval="1h", group_by='ticker')
         
         market_data = []
         fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.08, row_heights=[0.7, 0.3],
-                            subplot_titles=("V4.6 PRO QUANT TERMINAL", "MOMENTUM (RSI 14)"))
+                            subplot_titles=("V5.0 PRO QUANT TERMINAL", "MOMENTUM (RSI 14)"))
         
         colors = {"Energy": "#ef4444", "Metals": "#f59e0b", "Agriculture": "#10b981", "Macro_Crypto": "#3b82f6"}
         trace_idx = 0
@@ -104,53 +108,51 @@ def get_dashboard():
             for name, tid in assets.items():
                 try:
                     hist = raw_data[tid].dropna() if len(ticker_ids) > 1 else raw_data.dropna()
-                    if len(hist) < 12: continue # LOWERED THRESHOLD: More assets will show up
+                    if len(hist) < 48: continue 
                     
                     base_p = hist['Close'].iloc[0]
                     perf = ((hist['Close'] / base_p) - 1) * 100
                     
-                    # 1. Real Trace
-                    fig.add_trace(go.Scatter(x=hist.index, y=perf, name=name, legendgroup=name, line=dict(color=colors[sector], width=2.5)), row=1, col=1)
+                    # 1. Real Price Trace
+                    fig.add_trace(go.Scatter(x=hist.index, y=perf, name=name, legendgroup=name, line=dict(color=colors[sector], width=2)), row=1, col=1)
                     
-                    # 2. Advanced Prediction
-                    proj_raw = get_quant_prediction(hist)
+                    # 2. V4.6 Projection (Visual dots)
+                    proj_raw = get_quant_prediction_v4(hist)
                     proj_perf = [((v / base_p) - 1) * 100 for v in proj_raw]
                     f_idx = pd.date_range(start=hist.index[-1], periods=25, freq='h')[1:]
-                    
                     fig.add_trace(go.Scatter(x=[hist.index[-1]] + list(f_idx), y=[perf.iloc[-1]] + list(proj_perf),
                                              name=f"{name} Forecast", legendgroup=name, showlegend=False,
-                                             line=dict(color=colors[sector], width=2, dash='dot'), opacity=0.4), row=1, col=1)
+                                             line=dict(color=colors[sector], width=1, dash='dot'), opacity=0.4), row=1, col=1)
                     
                     # 3. RSI
                     d = hist['Close'].diff(); g = d.where(d > 0, 0).rolling(14).mean(); l = -d.where(d < 0, 0).rolling(14).mean()
                     rsi = 100 - (100 / (1 + (g/(l + 1e-9))))
-                    fig.add_trace(go.Scatter(x=hist.index, y=rsi, showlegend=False, legendgroup=name, line=dict(color=colors[sector], width=1, dash='dot'), opacity=0.2), row=2, col=1)
+                    fig.add_trace(go.Scatter(x=hist.index, y=rsi, showlegend=False, legendgroup=name, line=dict(color=colors[sector], width=1), opacity=0.3), row=2, col=1)
 
-                    # Quick Accuracy Check
-                    acc = round((sum(np.sign(perf.diff().tail(12).values) == np.sign(np.diff([perf.iloc[-1]] + list(proj_perf[:12])))) / 12) * 100, 1)
+                    # 4. V5.0 HF Inference for Table
+                    ai_v5 = get_ai_prediction_v5(name, hist['Close'].tolist())
                     
-                    market_data.append({"Asset": name, "Sector": sector, "Price": round(hist['Close'].iloc[-1], 2), "Perf": round(perf.iloc[-1], 2), "Acc": acc, "Trend": "UP" if perf.iloc[-1] > perf.rolling(20).mean().iloc[-1] else "DOWN"})
+                    market_data.append({
+                        "Asset": name, "Sector": sector, "Price": round(hist['Close'].iloc[-1], 2),
+                        "Perf": round(perf.iloc[-1], 2), 
+                        "AI_Trend": ai_v5['prediction'] if ai_v5 else "N/A",
+                        "AI_Conf": ai_v5['confidence'] if ai_v5 else "N/A",
+                        "AI_Max": ai_v5['expected_max'] if ai_v5 else 0,
+                        "AI_Min": ai_v5['expected_min'] if ai_v5 else 0
+                    })
                     trace_idx += 3
                 except: continue
 
-        # UI & LEGEND FIX
-        btns = [dict(method="restyle", label="GLOBAL VIEW", args=[{"visible": [True] * trace_idx}])]
-        for s_name in CATEGORIZED_TICKERS.keys():
-            vis = []
-            for s, a in CATEGORIZED_TICKERS.items():
-                for _ in a:
-                    v = (s == s_name); vis.extend([v, v, v])
-            btns.append(dict(method="restyle", label=s_name.upper(), args=[{"visible": vis}]))
-
-        fig.update_layout(template="plotly_dark", height=850, margin=dict(t=150, b=50), paper_bgcolor="#0a0a0a", plot_bgcolor="#0a0a0a",
-                          legend=dict(itemclick="toggleothers", itemdoubleclick="toggle", font=dict(size=10), orientation="v", x=1.02, y=0.5),
-                          updatemenus=[dict(type="buttons", direction="right", x=0.5, y=1.18, xanchor="center", buttons=btns, bgcolor="#1e293b", font=dict(color="white"), active=-1)])
-
-        # CSS & TABLE
-        css = "<style>rect.updatemenu-item-rect { fill: #1e293b !important; } rect.updatemenu-item-rect:hover { fill: #334155 !important; } rect.updatemenu-item-rect.active, rect.updatemenu-item-rect[fill='#F4F4F4'] { fill: #2563eb !important; } text.updatemenu-item-text { fill: #ffffff !important; font-weight: bold !important; pointer-events: none !important; } table { width: 100%; border-collapse: collapse; color: white; table-layout: fixed; } th { padding: 15px; text-align: left; background-color: #111827; color: #94a3b8; } tr { border-bottom: 1px solid #1f2937; }</style>"
-        df_m = pd.DataFrame(market_data).sort_values(by="Perf", ascending=False)
-        rows = "".join([f"<tr><td style='padding:12px; font-weight:bold; text-align:left;'>{r['Asset']}</td><td style='color:#4b5563;'>{r['Sector']}</td><td>{r['Price']}</td><td style='color:{'#10b981' if r['Perf']>0 else '#ef4444'}; font-weight:bold;'>{r['Perf']}%</td><td style='color:#3b82f6;'>{r['Acc']}%</td><td>{r['Trend']}</td></tr>" for _, r in df_m.iterrows()])
+        # UI & TABLE
+        css = "<style>body{background:#0a0a0a; color:white; font-family:sans-serif;} table{width:100%; border-collapse:collapse;} th{background:#111827; padding:15px; text-align:left; color:#94a3b8;} td{padding:12px; border-bottom:1px solid #1f2937;} .up{color:#10b981;} .down{color:#ef4444;} .conf{color:#3b82f6; font-size:0.8em;}</style>"
         
-        return HTMLResponse(content=f"<html><head>{css}</head><body style='margin:0; background:#0a0a0a;'>{fig.to_html(full_html=False, include_plotlyjs='cdn')}<div style='background:#0a0a0a; padding:40px; font-family:sans-serif;'><h2 style='text-align:center; color:#64748b; letter-spacing: 2px;'>V4.6 INSTITUTIONAL SUMMARY</h2><table><thead><tr><th>ASSET</th><th>SECTOR</th><th>PRICE</th><th>7D PERF</th><th>ACCURACY</th><th>TREND</th></tr></thead><tbody>{rows}</tbody></table></div></body></html>")
+        rows = ""
+        for r in market_data:
+            trend_class = "up" if r['AI_Trend'] == "UP" else "down"
+            rows += f"<tr><td><b>{r['Asset']}</b></td><td>{r['Sector']}</td><td>${r['Price']}</td>"
+            rows += f"<td>{r['Perf']}%</td><td class='{trend_class}'>{r['AI_Trend']} <span class='conf'>({r['AI_Conf']})</span></td>"
+            rows += f"<td><span class='up'>H: {r['AI_Max']}</span><br><span class='down'>L: {r['AI_Min']}</span></td></tr>"
+        
+        return HTMLResponse(content=f"<html><head>{css}</head><body>{fig.to_html(full_html=False, include_plotlyjs='cdn')}<div style='padding:40px;'><h2>V5.0 DEEP LEARNING SUMMARY</h2><table><thead><tr><th>ASSET</th><th>SECTOR</th><th>LIVE PRICE</th><th>7D PERF</th><th>AI TREND</th><th>AI TARGET RANGE (24H)</th></tr></thead><tbody>{rows}</tbody></table></div></body></html>")
     except Exception as e:
         return HTMLResponse(content=f"<h1>Error</h1><code>{str(e)}</code>", status_code=500)
