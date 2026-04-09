@@ -9,19 +9,21 @@ import plotly.graph_objects as go
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
 from plotly.subplots import make_subplots
-from gradio_client import Client # <--- Usado ahora correctamente
+from gradio_client import Client
 from supabase import create_client
 
 app = FastAPI()
 
-# --- CONFIGURACIÓN ---
+# --- CONFIG ---
 URL_SB = os.getenv("URL_SB")
 KEY_SB = os.getenv("KEY_SB")
+
 try:
     supabase = create_client(URL_SB, KEY_SB)
-    print("✅ Conectado a Supabase", flush=True)
-except:
+    print("✅ Supabase conectado.", flush=True)
+except Exception as e:
     supabase = None
+    print(f"❌ Error Supabase: {e}", flush=True)
 
 CATEGORIZED_TICKERS = {
     "Energy": {"Crude_Oil": "CL=F", "Brent_Oil": "BZ=F", "Natural_Gas": "NG=F", "Gasoline": "RB=F", "Heating_Oil": "HO=F", "Uranium": "URA"},
@@ -31,57 +33,65 @@ CATEGORIZED_TICKERS = {
 }
 ALL_TICKERS = {k: v for cat in CATEGORIZED_TICKERS.values() for k, v in cat.items()}
 
-# --- MOTOR IA V5 ---
 def get_ai_prediction_v5(asset_name, prices_list):
     try:
-        # Usamos el Gradio Client que estaba sin usar
         client = Client("marcosrgdata/trading-brain-v5")
         p_str = ",".join(map(str, prices_list[-48:]))
-        result = client.predict(asset_name=asset_name, prices_string=p_str, api_name="/predict_v5")
-        return result
-    except Exception as e:
-        print(f"⚠️ Error IA en {asset_name}: {e}", flush=True)
-        return None
+        return client.predict(asset_name=asset_name, prices_string=p_str, api_name="/predict_v5")
+    except: return None
 
-# --- WORKER (HACE QUE LAS TABLAS SUBAN) ---
+# --- WORKER BLINDADO (Arregla el error de 'Series') ---
 def background_worker():
     while True:
-        print(f"🤖 Ciclo de actualización: {datetime.datetime.now()}", flush=True)
+        print(f"🤖 Ronda iniciada: {datetime.datetime.now()}", flush=True)
         for name, tid in ALL_TICKERS.items():
             try:
-                # Descargamos datos (bajamos el umbral para que no falte ninguno)
-                df = yf.download(tid, period="7d", interval="1h", progress=False).dropna()
-                if df.empty: continue
+                # Bajamos 14d para que ETFs (Steel, Uranium) tengan >48 horas de datos
+                df = yf.download(tid, period="14d", interval="1h", progress=False)
                 
-                lp = round(float(df['Close'].iloc[-1]), 2)
+                if df.empty: continue
+
+                # MÁGIA: Si yfinance devuelve MultiIndex (Series error), lo aplanamos
+                if isinstance(df.columns, pd.MultiIndex):
+                    df.columns = df.columns.get_level_values(-1)
+                
+                df = df.dropna()
+                
+                # Extraemos valores como escalares puros para evitar el error 'Series'
+                lp = float(df['Close'].iloc[-1])
                 
                 if supabase:
-                    # 1. ACTUALIZA HISTORIAL (Sube el contador de 20.440)
+                    # 1. SIEMPRE GUARDAR HISTORIAL (Suben las 20.440 filas)
                     ma20 = df['Close'].tail(20).mean()
-                    trend_label = "BULLISH" if lp > ma20 else "BEARISH"
                     supabase.table("precios_historicos").insert({
-                        "activo": name, "precio": lp, "tendencia": trend_label
+                        "activo": name, "precio": round(lp, 2), 
+                        "tendencia": "BULLISH" if lp > ma20 else "BEARISH"
                     }).execute()
 
-                    # 2. ACTUALIZA TABLA IA (Usa el Gradio Client)
-                    ai = get_ai_prediction_v5(name, df['Close'].tolist())
-                    if ai:
-                        supabase.table("ai_predictions_v5").upsert({
-                            "asset": name, 
-                            "trend": ai['prediction'],
-                            "confidence": ai['confidence'],
-                            "target_max": float(ai['expected_max']),
-                            "target_min": float(ai['expected_min']),
-                            "real_max_24h": float(df['High'].tail(24).max()),
-                            "real_min_24h": float(df['Low'].tail(24).min())
-                        }).execute()
+                    # 2. IA Y RANGOS REALES
+                    r_max = float(df['High'].tail(24).max())
+                    r_min = float(df['Low'].tail(24).min())
+                    
+                    ai_trend, ai_conf, ai_max, ai_min = "N/A", "0%", 0, 0
+                    
+                    if len(df) >= 48:
+                        ai = get_ai_prediction_v5(name, df['Close'].tolist())
+                        if ai:
+                            ai_trend, ai_conf = ai['prediction'], ai['confidence']
+                            ai_max, ai_min = float(ai['expected_max']), float(ai['expected_min'])
+                    
+                    supabase.table("ai_predictions_v5").upsert({
+                        "asset": name, "trend": ai_trend, "confidence": ai_conf,
+                        "target_max": ai_max, "target_min": ai_min,
+                        "real_max_24h": r_max, "real_min_24h": r_min
+                    }).execute()
                 
-                print(f"✅ {name} actualizado.", flush=True)
-                time.sleep(1.5) 
+                print(f"✅ {name} ok.", flush=True)
+                time.sleep(1.2)
             except Exception as e:
                 print(f"❌ Error en {name}: {e}", flush=True)
         
-        print("☕ Ronda completada. Esperando 15 min.", flush=True)
+        print("☕ Ronda terminada. Esperando 15 min.", flush=True)
         time.sleep(900)
 
 threading.Thread(target=background_worker, daemon=True).start()
@@ -108,13 +118,16 @@ def get_dashboard():
         for sector, assets in CATEGORIZED_TICKERS.items():
             for name, tid in assets.items():
                 try:
-                    hist = raw_data[tid].dropna() if len(ticker_ids) > 1 else raw_data.dropna()
-                    # Bajamos el umbral de 168 a 24 para que NO falten activos
+                    # Arreglo para MultiIndex en el download del Dashboard
+                    hist = raw_data[tid].dropna()
+                    if isinstance(hist.columns, pd.MultiIndex):
+                        hist.columns = hist.columns.get_level_values(-1)
+                    
                     if len(hist) < 24: continue
                     
-                    target_7d = hist.index[-1] - pd.Timedelta(days=7)
-                    idx_7d = hist.index.get_indexer([target_7d], method='nearest')[0]
-                    perf = round(((hist['Close'].iloc[-1] / hist['Close'].iloc[idx_7d]) - 1) * 100, 2)
+                    t7d = hist.index[-1] - pd.Timedelta(days=7)
+                    idx7 = hist.index.get_indexer([t7d], method='nearest')[0]
+                    perf = round(((hist['Close'].iloc[-1] / hist['Close'].iloc[idx7]) - 1) * 100, 2)
                     
                     fig.add_trace(go.Candlestick(x=hist.index, open=hist['Open'], high=hist['High'], low=hist['Low'], close=hist['Close'],
                                                  name=name, legendgroup=name, increasing_line_color=colors[sector], decreasing_line_color='#ffffff'), row=1, col=1)
@@ -133,7 +146,6 @@ def get_dashboard():
                     trace_idx += 2
                 except: continue
 
-        # --- BOTONES Y LEYENDA (ESTILO V4.6) ---
         btns = [dict(method="restyle", label="GLOBAL VIEW", args=[{"visible": [True] * trace_idx}])]
         for s_name in CATEGORIZED_TICKERS.keys():
             vis = []
@@ -141,19 +153,4 @@ def get_dashboard():
                 for _ in a: vis.extend([(s == s_name)] * 2)
             btns.append(dict(method="restyle", label=s_name.upper(), args=[{"visible": vis}]))
 
-        fig.update_layout(template="plotly_dark", height=850, margin=dict(t=150, b=50), paper_bgcolor="#0a0a0a", plot_bgcolor="#0a0a0a",
-                          xaxis_rangeslider_visible=False,
-                          legend=dict(itemclick="toggleothers", itemdoubleclick="toggle", font=dict(size=10), orientation="v", x=1.02, y=0.5),
-                          updatemenus=[dict(type="buttons", direction="right", x=0.5, y=1.18, xanchor="center", buttons=btns, bgcolor="#1e293b", font=dict(color="white"), active=-1)])
-
-        css = "<style>rect.updatemenu-item-rect { fill: #1e293b !important; } rect.updatemenu-item-rect.active { fill: #2563eb !important; } table { width: 100%; border-collapse: collapse; color: white; table-layout: fixed; font-family: sans-serif; } th { padding: 15px; text-align: left; background-color: #111827; color: #94a3b8; font-size: 0.8em; } tr { border-bottom: 1px solid #1f2937; } .up { color: #10b981; font-weight: bold; } .down { color: #ef4444; font-weight: bold; }</style>"
-        
-        rows = ""
-        for r in sorted(market_data, key=lambda x: x['Perf'], reverse=True):
-            tc = "up" if r['Trend'] == "UP" else "down"
-            pc = "up" if r['Perf'] > 0 else "down"
-            rows += f"<tr><td><b>{r['Asset']}</b></td><td>${r['Price']}</td><td class='{pc}'>{r['Perf']}%</td><td style='color:#64748b'>MAX: ${r['R_Max']}<br>MIN: ${r['R_Min']}</td><td class='{tc}'>{r['Trend']} <small style='color:#3b82f6;'>({r['Conf']})</small></td><td>L: {r['T_Min']}<br>H: {r['T_Max']}</td></tr>"
-        
-        return HTMLResponse(content=f"<html><head>{css}</head><body style='margin:0; background:#0a0a0a;'>{fig.to_html(full_html=False, include_plotlyjs='cdn')}<div style='background:#0a0a0a; padding:40px;'><table><thead><tr><th>ASSET</th><th>PRICE</th><th>7D ROLL %</th><th>REAL 24H RANGE</th><th>AI SIGNAL</th><th>AI TARGET</th></tr></thead><tbody>{rows}</tbody></table></div></body></html>")
-    except Exception as e:
-        return HTMLResponse(content=f"<h1>Error</h1><code>{str(e)}</code>", status_code=500)
+        fig.update_layout(template="plotly_dark", height=850, margin=dict(t=150, b=5
