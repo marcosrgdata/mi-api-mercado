@@ -20,7 +20,7 @@ KEY_SB = os.getenv("KEY_SB")
 
 try:
     supabase = create_client(URL_SB, KEY_SB)
-    print("✅ Supabase conectado.", flush=True)
+    print("✅ Conexión con Supabase establecida.", flush=True)
 except Exception as e:
     supabase = None
     print(f"❌ Error Supabase: {e}", flush=True)
@@ -33,6 +33,17 @@ CATEGORIZED_TICKERS = {
 }
 ALL_TICKERS = {k: v for cat in CATEGORIZED_TICKERS.values() for k, v in cat.items()}
 
+# --- UTILS ---
+def clean_df(df):
+    """Limpia el DataFrame de Yahoo Finance para evitar errores de MultiIndex."""
+    if df.empty: return df
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+    # Si aún así Close es un DataFrame (duplicado), cogemos la primera columna
+    if isinstance(df['Close'], pd.DataFrame):
+        df = df.loc[:, ~df.columns.duplicated()]
+    return df
+
 def get_ai_prediction_v5(asset_name, prices_list):
     try:
         client = Client("marcosrgdata/trading-brain-v5")
@@ -40,35 +51,30 @@ def get_ai_prediction_v5(asset_name, prices_list):
         return client.predict(asset_name=asset_name, prices_string=p_str, api_name="/predict_v5")
     except: return None
 
-# --- WORKER BLINDADO (Arregla el error de 'Series') ---
+# --- WORKER ROBUSTO (Para que suban las 20.440 filas) ---
 def background_worker():
     while True:
-        print(f"🤖 Ronda iniciada: {datetime.datetime.now()}", flush=True)
+        print(f"🤖 Iniciando ronda de actualización: {datetime.datetime.now()}", flush=True)
         for name, tid in ALL_TICKERS.items():
             try:
-                # Bajamos 14d para que ETFs (Steel, Uranium) tengan >48 horas de datos
+                # Descargamos 14 días para que ETFs tengan datos suficientes (>48h)
                 df = yf.download(tid, period="14d", interval="1h", progress=False)
+                df = clean_df(df).dropna()
                 
                 if df.empty: continue
-
-                # MÁGIA: Si yfinance devuelve MultiIndex (Series error), lo aplanamos
-                if isinstance(df.columns, pd.MultiIndex):
-                    df.columns = df.columns.get_level_values(-1)
                 
-                df = df.dropna()
-                
-                # Extraemos valores como escalares puros para evitar el error 'Series'
-                lp = float(df['Close'].iloc[-1])
+                # Extraemos el precio actual como un número puro (float)
+                current_p = float(df['Close'].iloc[-1])
                 
                 if supabase:
-                    # 1. SIEMPRE GUARDAR HISTORIAL (Suben las 20.440 filas)
+                    # 1. SIEMPRE INSERTAR EN HISTÓRICO (Para que suba el contador)
                     ma20 = df['Close'].tail(20).mean()
                     supabase.table("precios_historicos").insert({
-                        "activo": name, "precio": round(lp, 2), 
-                        "tendencia": "BULLISH" if lp > ma20 else "BEARISH"
+                        "activo": name, "precio": round(current_p, 2),
+                        "tendencia": "BULLISH" if current_p > ma20 else "BEARISH"
                     }).execute()
 
-                    # 2. IA Y RANGOS REALES
+                    # 2. ACTUALIZAR PREDICCIÓN IA Y RANGOS
                     r_max = float(df['High'].tail(24).max())
                     r_min = float(df['Low'].tail(24).min())
                     
@@ -86,12 +92,12 @@ def background_worker():
                         "real_max_24h": r_max, "real_min_24h": r_min
                     }).execute()
                 
-                print(f"✅ {name} ok.", flush=True)
+                print(f"✅ {name}: Actualizado.", flush=True)
                 time.sleep(1.2)
             except Exception as e:
                 print(f"❌ Error en {name}: {e}", flush=True)
         
-        print("☕ Ronda terminada. Esperando 15 min.", flush=True)
+        print("☕ Ronda completada. Esperando 15 min.", flush=True)
         time.sleep(900)
 
 threading.Thread(target=background_worker, daemon=True).start()
@@ -118,27 +124,26 @@ def get_dashboard():
         for sector, assets in CATEGORIZED_TICKERS.items():
             for name, tid in assets.items():
                 try:
-                    # Arreglo para MultiIndex en el download del Dashboard
-                    hist = raw_data[tid].dropna()
-                    if isinstance(hist.columns, pd.MultiIndex):
-                        hist.columns = hist.columns.get_level_values(-1)
-                    
+                    hist = clean_df(raw_data[tid]).dropna()
                     if len(hist) < 24: continue
                     
+                    # Rolling 7D Perf
                     t7d = hist.index[-1] - pd.Timedelta(days=7)
                     idx7 = hist.index.get_indexer([t7d], method='nearest')[0]
                     perf = round(((hist['Close'].iloc[-1] / hist['Close'].iloc[idx7]) - 1) * 100, 2)
                     
+                    # Candlestick
                     fig.add_trace(go.Candlestick(x=hist.index, open=hist['Open'], high=hist['High'], low=hist['Low'], close=hist['Close'],
                                                  name=name, legendgroup=name, increasing_line_color=colors[sector], decreasing_line_color='#ffffff'), row=1, col=1)
                     
-                    delta = hist['Close'].diff(); g = delta.where(delta > 0, 0).rolling(14).mean(); l = -delta.where(delta < 0, 0).rolling(14).mean()
+                    # RSI
+                    d = hist['Close'].diff(); g = d.where(d > 0, 0).rolling(14).mean(); l = -d.where(d < 0, 0).rolling(14).mean()
                     rsi = 100 - (100 / (1 + (g / (l + 1e-9))))
                     fig.add_trace(go.Scatter(x=hist.index, y=rsi, showlegend=False, legendgroup=name, line=dict(color=colors[sector], width=1), opacity=0.3), row=2, col=1)
 
                     db = ai_data.get(name, {})
                     market_data.append({
-                        "Asset": name, "Sector": sector, "Price": round(hist['Close'].iloc[-1], 2), "Perf": perf,
+                        "Asset": name, "Sector": sector, "Price": round(float(hist['Close'].iloc[-1]), 2), "Perf": perf,
                         "R_Max": db.get('real_max_24h', 0), "R_Min": db.get('real_min_24h', 0),
                         "Trend": db.get('trend', 'N/A'), "Conf": db.get('confidence', '0%'),
                         "T_Max": db.get('target_max', 0), "T_Min": db.get('target_min', 0)
@@ -146,6 +151,7 @@ def get_dashboard():
                     trace_idx += 2
                 except: continue
 
+        # --- BOTONES Y LEYENDA (ESTILO V4.6) ---
         btns = [dict(method="restyle", label="GLOBAL VIEW", args=[{"visible": [True] * trace_idx}])]
         for s_name in CATEGORIZED_TICKERS.keys():
             vis = []
@@ -153,4 +159,38 @@ def get_dashboard():
                 for _ in a: vis.extend([(s == s_name)] * 2)
             btns.append(dict(method="restyle", label=s_name.upper(), args=[{"visible": vis}]))
 
-        fig.update_layout(template="plotly_dark", height=850, margin=dict(t=150, b=5
+        fig.update_layout(template="plotly_dark", height=850, margin=dict(t=150, b=50), paper_bgcolor="#0a0a0a", plot_bgcolor="#0a0a0a",
+                          xaxis_rangeslider_visible=False,
+                          legend=dict(itemclick="toggleothers", itemdoubleclick="toggle", font=dict(size=10), orientation="v", x=1.02, y=0.5),
+                          updatemenus=[dict(type="buttons", direction="right", x=0.5, y=1.18, xanchor="center", buttons=btns, bgcolor="#1e293b", font=dict(color="white"), active=-1)])
+
+        # Estilo visual de la barrita de posición
+        def render_bar(curr, t_min, t_max):
+            if not t_max or t_max == t_min: return ""
+            pos = max(0, min(100, ((curr - t_min) / (t_max - t_min)) * 100))
+            color = "#ef4444" if pos > 80 else "#10b981" if pos < 20 else "#3b82f6"
+            return f'<div style="width:100%; background:#1e293b; height:6px; border-radius:3px; margin-top:8px; position:relative;"><div style="position:absolute; left:{pos}%; width:10px; height:10px; background:{color}; border-radius:50%; top:-2px; box-shadow:0 0 5px {color};"></div></div>'
+
+        css = "<style>rect.updatemenu-item-rect { fill: #1e293b !important; } rect.updatemenu-item-rect.active { fill: #2563eb !important; } table { width: 100%; border-collapse: collapse; color: white; table-layout: fixed; font-family: sans-serif; } th { padding: 15px; text-align: left; background-color: #111827; color: #94a3b8; font-size: 0.8em; } tr { border-bottom: 1px solid #1f2937; } .up { color: #10b981; font-weight: bold; } .down { color: #ef4444; font-weight: bold; }</style>"
+        
+        rows = ""
+        for r in sorted(market_data, key=lambda x: x['Perf'], reverse=True):
+            tc = "up" if r['Trend'] == "UP" else "down"
+            pc = "up" if r['Perf'] > 0 else "down"
+            rows += f"""
+            <tr>
+                <td style='padding:12px;'><b>{r['Asset']}</b><br><small style='color:#4b5563'>{r['Sector']}</small></td>
+                <td>${r['Price']}</td>
+                <td class='{pc}'>{r['Perf']}%</td>
+                <td style='color:#64748b'>MAX: ${r['R_Max']}<br>MIN: ${r['R_Min']}</td>
+                <td class='{tc}'>{r['Trend']} <small style='color:#3b82f6;'>({r['Conf']})</small></td>
+                <td style='width:220px; padding:10px;'>
+                    <div style='display:flex; justify-content:space-between; font-size:0.7em;'><span class='down'>L: {r['T_Min']}</span><span class='up'>H: {r['T_Max']}</span></div>
+                    {render_bar(r['Price'], r['T_Min'], r['T_Max'])}
+                </td>
+            </tr>
+            """
+        
+        return HTMLResponse(content=f"<html><head>{css}</head><body style='margin:0; background:#0a0a0a;'>{fig.to_html(full_html=False, include_plotlyjs='cdn')}<div style='background:#0a0a0a; padding:40px;'><h2 style='text-align:center; color:#64748b; letter-spacing: 2px; font-family:sans-serif;'>V5.0 INSTITUTIONAL MONITOR</h2><table><thead><tr><th>ASSET</th><th>PRICE</th><th>7D ROLL %</th><th>REAL 24H RANGE</th><th>AI SIGNAL</th><th>AI POSITIONING</th></tr></thead><tbody>{rows}</tbody></table></div></body></html>")
+    except Exception as e:
+        return HTMLResponse(content=f"<h1>Error</h1><code>{str(e)}</code>", status_code=500)
