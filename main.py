@@ -17,7 +17,13 @@ app = FastAPI()
 # --- CONFIG ---
 URL_SB = os.getenv("URL_SB")
 KEY_SB = os.getenv("KEY_SB")
-supabase = create_client(URL_SB, KEY_SB) if URL_SB and KEY_SB else None
+
+try:
+    supabase = create_client(URL_SB, KEY_SB)
+    print("✅ Supabase conectado.", flush=True)
+except Exception as e:
+    supabase = None
+    print(f"❌ Error conexión Supabase: {e}", flush=True)
 
 CATEGORIZED_TICKERS = {
     "Energy": {"Crude_Oil": "CL=F", "Brent_Oil": "BZ=F", "Natural_Gas": "NG=F", "Gasoline": "RB=F", "Heating_Oil": "HO=F", "Uranium": "URA"},
@@ -27,7 +33,6 @@ CATEGORIZED_TICKERS = {
 }
 ALL_TICKERS = {k: v for cat in CATEGORIZED_TICKERS.values() for k, v in cat.items()}
 
-# --- AI CORE ---
 def get_ai_prediction_v5(asset_name, prices_list):
     try:
         client = Client("marcosrgdata/trading-brain-v5")
@@ -35,27 +40,50 @@ def get_ai_prediction_v5(asset_name, prices_list):
         return client.predict(asset_name=asset_name, prices_string=p_str, api_name="/predict_v5")
     except: return None
 
-# --- BACKGROUND WORKER (Updates Supabase) ---
+# --- WORKER TOTAL (Históricos + IA) ---
 def background_worker():
     while True:
+        print(f"🤖 Ciclo iniciado: {datetime.datetime.now()}", flush=True)
         for name, tid in ALL_TICKERS.items():
             try:
-                df = yf.download(tid, period="5d", interval="1h", progress=False).dropna()
+                # 1. Descarga datos
+                df = yf.download(tid, period="7d", interval="1h", progress=False).dropna()
                 if len(df) < 48: continue
-                ai = get_ai_prediction_v5(name, df['Close'].tolist())
-                if ai and supabase:
-                    supabase.table("ai_predictions_v5").upsert({
-                        "asset": name, "trend": ai['prediction'], "confidence": ai['confidence'],
-                        "target_max": float(ai['expected_max']), "target_min": float(ai['expected_min']),
-                        "real_max_24h": float(df['High'].tail(24).max()), "real_min_24h": float(df['Low'].tail(24).min())
+                
+                lp = round(float(df['Close'].iloc[-1]), 2)
+                
+                if supabase:
+                    # A. INSERTAR EN HISTÓRICO (Para que suban las 20.440 filas)
+                    ma20 = df['Close'].tail(20).mean()
+                    trend_label = "BULLISH" if lp > ma20 else "BEARISH"
+                    supabase.table("precios_historicos").insert({
+                        "activo": name, "precio": lp, "tendencia": trend_label
                     }).execute()
+
+                    # B. ACTUALIZAR PREDICCIÓN IA (Para el Dashboard rápido)
+                    ai = get_ai_prediction_v5(name, df['Close'].tolist())
+                    if ai:
+                        supabase.table("ai_predictions_v5").upsert({
+                            "asset": name,
+                            "trend": ai['prediction'],
+                            "confidence": ai['confidence'],
+                            "target_max": float(ai['expected_max']),
+                            "target_min": float(ai['expected_min']),
+                            "real_max_24h": float(df['High'].tail(24).max()),
+                            "real_min_24h": float(df['Low'].tail(24).min())
+                        }).execute()
+                
+                print(f"✅ {name} procesado (Precio e IA)", flush=True)
                 time.sleep(1.5)
-            except: continue
+            except Exception as e:
+                print(f"⚠️ Error en {name}: {e}", flush=True)
+        
+        print("☕ Fin del ciclo. Esperando 15 min.", flush=True)
         time.sleep(900)
 
 threading.Thread(target=background_worker, daemon=True).start()
 
-# --- UI HELPERS ---
+# --- UI RENDERER ---
 def render_thermo(curr, t_min, t_max):
     if not t_max or t_max == t_min: return ""
     pos = max(0, min(100, ((curr - t_min) / (t_max - t_min)) * 100))
@@ -87,14 +115,13 @@ def get_dashboard():
                     hist = raw_data[tid].dropna() if len(ticker_ids) > 1 else raw_data.dropna()
                     if len(hist) < 48: continue
                     
-                    # Rolling 7D
-                    idx_7d = hist.index.get_indexer([hist.index[-1] - pd.Timedelta(days=7)], method='nearest')[0]
+                    target_7d = hist.index[-1] - pd.Timedelta(days=7)
+                    idx_7d = hist.index.get_indexer([target_7d], method='nearest')[0]
                     perf = round(((hist['Close'].iloc[-1] / hist['Close'].iloc[idx_7d]) - 1) * 100, 2)
                     
-                    # 1. Candlestick
                     fig.add_trace(go.Candlestick(x=hist.index, open=hist['Open'], high=hist['High'], low=hist['Low'], close=hist['Close'],
                                                  name=name, legendgroup=name, increasing_line_color=colors[sector], decreasing_line_color='#ffffff'), row=1, col=1)
-                    # 2. RSI
+                    
                     delta = hist['Close'].diff(); g = delta.where(delta > 0, 0).rolling(14).mean(); l = -delta.where(delta < 0, 0).rolling(14).mean()
                     rsi = 100 - (100 / (1 + (g / (l + 1e-9))))
                     fig.add_trace(go.Scatter(x=hist.index, y=rsi, showlegend=False, legendgroup=name, line=dict(color=colors[sector], width=1), opacity=0.3), row=2, col=1)
@@ -109,7 +136,6 @@ def get_dashboard():
                     trace_idx += 2
                 except: continue
 
-        # --- BUTTONS & LEGEND (V4.6 STYLE) ---
         btns = [dict(method="restyle", label="GLOBAL VIEW", args=[{"visible": [True] * trace_idx}])]
         for s_name in CATEGORIZED_TICKERS.keys():
             vis = []
@@ -122,19 +148,7 @@ def get_dashboard():
                           legend=dict(itemclick="toggleothers", itemdoubleclick="toggle", font=dict(size=10), orientation="v", x=1.02, y=0.5),
                           updatemenus=[dict(type="buttons", direction="right", x=0.5, y=1.18, xanchor="center", buttons=btns, bgcolor="#1e293b", font=dict(color="white"), active=-1)])
 
-        # --- CSS & TABLE (V4.6 STYLE) ---
-        css = """
-        <style>
-            rect.updatemenu-item-rect { fill: #1e293b !important; } 
-            rect.updatemenu-item-rect:hover { fill: #334155 !important; } 
-            rect.updatemenu-item-rect.active { fill: #2563eb !important; } 
-            text.updatemenu-item-text { fill: #ffffff !important; font-weight: bold !important; } 
-            table { width: 100%; border-collapse: collapse; color: white; table-layout: fixed; font-family: sans-serif; } 
-            th { padding: 15px; text-align: left; background-color: #111827; color: #94a3b8; font-size: 0.8em; } 
-            tr { border-bottom: 1px solid #1f2937; }
-            .up { color: #10b981; font-weight: bold; } .down { color: #ef4444; font-weight: bold; }
-        </style>
-        """
+        css = "<style>rect.updatemenu-item-rect { fill: #1e293b !important; } rect.updatemenu-item-rect:hover { fill: #334155 !important; } rect.updatemenu-item-rect.active { fill: #2563eb !important; } text.updatemenu-item-text { fill: #ffffff !important; font-weight: bold !important; } table { width: 100%; border-collapse: collapse; color: white; table-layout: fixed; font-family: sans-serif; } th { padding: 15px; text-align: left; background-color: #111827; color: #94a3b8; font-size: 0.8em; } tr { border-bottom: 1px solid #1f2937; } .up { color: #10b981; font-weight: bold; } .down { color: #ef4444; font-weight: bold; }</style>"
         
         rows = ""
         for r in sorted(market_data, key=lambda x: x['Perf'], reverse=True):
@@ -153,7 +167,6 @@ def get_dashboard():
                 </td>
             </tr>
             """
-        
         return HTMLResponse(content=f"<html><head>{css}</head><body style='margin:0; background:#0a0a0a;'>{fig.to_html(full_html=False, include_plotlyjs='cdn')}<div style='background:#0a0a0a; padding:40px;'><h2 style='text-align:center; color:#64748b; letter-spacing: 2px; font-family:sans-serif;'>V5.0 INSTITUTIONAL MONITOR</h2><table><thead><tr><th>ASSET</th><th>PRICE</th><th>7D ROLL %</th><th>REAL 24H RANGE</th><th>AI SIGNAL</th><th>AI POSITIONING</th></tr></thead><tbody>{rows}</tbody></table></div></body></html>")
     except Exception as e:
         return HTMLResponse(content=f"<h1>Error</h1><code>{str(e)}</code>", status_code=500)
