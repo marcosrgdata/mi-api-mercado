@@ -10,8 +10,17 @@ from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
 from plotly.subplots import make_subplots
 from gradio_client import Client
+from supabase import create_client # Necesario para las tablas
 
 app = FastAPI()
+
+# --- CONFIGURACIÓN DE SUPABASE (Indispensable para que suban las filas) ---
+URL_SB = os.getenv("URL_SB")
+KEY_SB = os.getenv("KEY_SB")
+try:
+    supabase = create_client(URL_SB, KEY_SB)
+except:
+    supabase = None
 
 # --- ASSET LIST ---
 CATEGORIZED_TICKERS = {
@@ -30,6 +39,37 @@ def get_ai_prediction_v5(asset_name, prices_list):
         return client.predict(asset_name=asset_name, prices_string=prices_string, api_name="/predict_v5")
     except: return None
 
+# --- ESTO ES LO QUE HACE QUE LAS FILAS AUMENTEN ---
+def background_worker():
+    while True:
+        print(f"🤖 Bot trabajando: {datetime.datetime.now()}", flush=True)
+        for name, tid in ALL_TICKERS.items():
+            try:
+                t = yf.Ticker(tid)
+                h = t.history(period="5d", interval="1h")
+                if not h.empty and supabase:
+                    lp = round(h['Close'].iloc[-1], 2)
+                    
+                    # 1. ACTUALIZA LA TABLA DE SIEMPRE (Aumentan las filas)
+                    ma = h['Close'].tail(20).mean()
+                    tr = "BULLISH" if lp > ma else "BEARISH"
+                    supabase.table("precios_historicos").insert({"activo": name, "precio": lp, "tendencia": tr}).execute()
+                    
+                    # 2. ACTUALIZA LA TABLA NUEVA (Para que el Dashboard cargue rápido)
+                    ai = get_ai_prediction_v5(name, h['Close'].tolist())
+                    if ai:
+                        supabase.table("ai_predictions_v5").upsert({
+                            "asset": name, "trend": ai['prediction'], "confidence": ai['confidence'],
+                            "target_max": float(ai['expected_max']), "target_min": float(ai['expected_min']),
+                            "real_max_24h": float(h['High'].tail(24).max()), "real_min_24h": float(h['Low'].tail(24).min())
+                        }).execute()
+                time.sleep(1.5)
+            except: continue
+        time.sleep(900) # Cada 15 minutos
+
+threading.Thread(target=background_worker, daemon=True).start()
+
+# --- TU DASHBOARD (Se queda igual, pero ahora sí tiene datos que leer) ---
 @app.get("/visual-dashboard", response_class=HTMLResponse)
 def get_dashboard():
     try:
