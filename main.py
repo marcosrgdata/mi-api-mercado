@@ -35,39 +35,43 @@ ALL_TICKERS = {k: v for cat in CATEGORIZED_TICKERS.values() for k, v in cat.item
 
 # --- UTILS ---
 def clean_df(df):
-    """Limpia el DataFrame de Yahoo Finance para evitar errores de MultiIndex."""
     if df.empty: return df
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
-    # Si aún así Close es un DataFrame (duplicado), cogemos la primera columna
     if isinstance(df['Close'], pd.DataFrame):
         df = df.loc[:, ~df.columns.duplicated()]
     return df
 
 def get_ai_prediction_v5(asset_name, prices_list):
     try:
+        # Ahora usamos Gradio Client correctamente
         client = Client("marcosrgdata/trading-brain-v5")
         p_str = ",".join(map(str, prices_list[-48:]))
+        # Enviamos la petición a Hugging Face
         return client.predict(asset_name=asset_name, prices_string=p_str, api_name="/predict_v5")
-    except: return None
+    except Exception as e:
+        print(f"⚠️ Error HF en {asset_name}: {e}", flush=True)
+        return None
 
-# --- WORKER ROBUSTO (Para que suban las 20.440 filas) ---
+# --- WORKER AJUSTADO (Fix Cotton) ---
 def background_worker():
     while True:
-        print(f"🤖 Iniciando ronda de actualización: {datetime.datetime.now()}", flush=True)
+        print(f"🤖 Ronda iniciada: {datetime.datetime.now()}", flush=True)
         for name, tid in ALL_TICKERS.items():
             try:
-                # Descargamos 14 días para que ETFs tengan datos suficientes (>48h)
-                df = yf.download(tid, period="14d", interval="1h", progress=False)
+                # Para Cotton y otros agrícolas, pedimos un poco más de margen (20d)
+                p = "20d" if name == "Cotton" else "14d"
+                df = yf.download(tid, period=p, interval="1h", progress=False)
                 df = clean_df(df).dropna()
                 
-                if df.empty: continue
+                if df.empty: 
+                    print(f"❌ {name}: No se recibieron datos de Yahoo.", flush=True)
+                    continue
                 
-                # Extraemos el precio actual como un número puro (float)
                 current_p = float(df['Close'].iloc[-1])
                 
                 if supabase:
-                    # 1. SIEMPRE INSERTAR EN HISTÓRICO (Para que suba el contador)
+                    # 1. SIEMPRE INSERTAR EN HISTÓRICO (Sube el contador 20.440+)
                     ma20 = df['Close'].tail(20).mean()
                     supabase.table("precios_historicos").insert({
                         "activo": name, "precio": round(current_p, 2),
@@ -75,16 +79,19 @@ def background_worker():
                     }).execute()
 
                     # 2. ACTUALIZAR PREDICCIÓN IA Y RANGOS
-                    r_max = float(df['High'].tail(24).max())
-                    r_min = float(df['Low'].tail(24).min())
+                    r_max = round(float(df['High'].tail(24).max()), 2)
+                    r_min = round(float(df['Low'].tail(24).min()), 2)
                     
                     ai_trend, ai_conf, ai_max, ai_min = "N/A", "0%", 0, 0
                     
+                    # Verificamos si tenemos suficientes datos para el modelo (48 horas)
                     if len(df) >= 48:
                         ai = get_ai_prediction_v5(name, df['Close'].tolist())
                         if ai:
                             ai_trend, ai_conf = ai['prediction'], ai['confidence']
-                            ai_max, ai_min = float(ai['expected_max']), float(ai['expected_min'])
+                            ai_max, ai_min = round(float(ai['expected_max']), 2), round(float(ai['expected_min']), 2)
+                    else:
+                        print(f"⚠️ {name}: Datos insuficientes para IA ({len(df)}/48)", flush=True)
                     
                     supabase.table("ai_predictions_v5").upsert({
                         "asset": name, "trend": ai_trend, "confidence": ai_conf,
@@ -93,7 +100,7 @@ def background_worker():
                     }).execute()
                 
                 print(f"✅ {name}: Actualizado.", flush=True)
-                time.sleep(1.2)
+                time.sleep(1.5)
             except Exception as e:
                 print(f"❌ Error en {name}: {e}", flush=True)
         
@@ -102,7 +109,7 @@ def background_worker():
 
 threading.Thread(target=background_worker, daemon=True).start()
 
-# --- DASHBOARD ---
+# --- DASHBOARD (Sin cambios, solo corrección estética) ---
 @app.get("/visual-dashboard", response_class=HTMLResponse)
 def get_dashboard():
     try:
@@ -127,16 +134,13 @@ def get_dashboard():
                     hist = clean_df(raw_data[tid]).dropna()
                     if len(hist) < 24: continue
                     
-                    # Rolling 7D Perf
                     t7d = hist.index[-1] - pd.Timedelta(days=7)
                     idx7 = hist.index.get_indexer([t7d], method='nearest')[0]
                     perf = round(((hist['Close'].iloc[-1] / hist['Close'].iloc[idx7]) - 1) * 100, 2)
                     
-                    # Candlestick
                     fig.add_trace(go.Candlestick(x=hist.index, open=hist['Open'], high=hist['High'], low=hist['Low'], close=hist['Close'],
                                                  name=name, legendgroup=name, increasing_line_color=colors[sector], decreasing_line_color='#ffffff'), row=1, col=1)
                     
-                    # RSI
                     d = hist['Close'].diff(); g = d.where(d > 0, 0).rolling(14).mean(); l = -d.where(d < 0, 0).rolling(14).mean()
                     rsi = 100 - (100 / (1 + (g / (l + 1e-9))))
                     fig.add_trace(go.Scatter(x=hist.index, y=rsi, showlegend=False, legendgroup=name, line=dict(color=colors[sector], width=1), opacity=0.3), row=2, col=1)
@@ -151,7 +155,6 @@ def get_dashboard():
                     trace_idx += 2
                 except: continue
 
-        # --- BOTONES Y LEYENDA (ESTILO V4.6) ---
         btns = [dict(method="restyle", label="GLOBAL VIEW", args=[{"visible": [True] * trace_idx}])]
         for s_name in CATEGORIZED_TICKERS.keys():
             vis = []
@@ -164,7 +167,6 @@ def get_dashboard():
                           legend=dict(itemclick="toggleothers", itemdoubleclick="toggle", font=dict(size=10), orientation="v", x=1.02, y=0.5),
                           updatemenus=[dict(type="buttons", direction="right", x=0.5, y=1.18, xanchor="center", buttons=btns, bgcolor="#1e293b", font=dict(color="white"), active=-1)])
 
-        # Estilo visual de la barrita de posición
         def render_bar(curr, t_min, t_max):
             if not t_max or t_max == t_min: return ""
             pos = max(0, min(100, ((curr - t_min) / (t_max - t_min)) * 100))
@@ -190,7 +192,6 @@ def get_dashboard():
                 </td>
             </tr>
             """
-        
         return HTMLResponse(content=f"<html><head>{css}</head><body style='margin:0; background:#0a0a0a;'>{fig.to_html(full_html=False, include_plotlyjs='cdn')}<div style='background:#0a0a0a; padding:40px;'><h2 style='text-align:center; color:#64748b; letter-spacing: 2px; font-family:sans-serif;'>V5.0 INSTITUTIONAL MONITOR</h2><table><thead><tr><th>ASSET</th><th>PRICE</th><th>7D ROLL %</th><th>REAL 24H RANGE</th><th>AI SIGNAL</th><th>AI POSITIONING</th></tr></thead><tbody>{rows}</tbody></table></div></body></html>")
     except Exception as e:
         return HTMLResponse(content=f"<h1>Error</h1><code>{str(e)}</code>", status_code=500)
