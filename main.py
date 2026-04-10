@@ -42,20 +42,17 @@ def get_ai_prediction_v5(asset_name, prices_list):
         client = Client("marcosrgdata/trading-brain-v5")
         p_str = ",".join(map(str, prices_list[-48:]))
         result = client.predict(asset_name=asset_name, prices_string=p_str, api_name="/predict_v5")
-        # Validamos que la respuesta tenga las llaves necesarias
         if result and isinstance(result, dict) and 'expected_max' in result:
             return result
         return None
-    except:
-        return None
+    except: return None
 
-# --- WORKER V5.4 (FIX KEYERROR COTTON) ---
+# --- WORKER V5.5 ---
 def background_worker():
     while True:
         print(f"🤖 Ciclo iniciado: {datetime.datetime.now()}", flush=True)
         for name, tid in ALL_TICKERS.items():
             try:
-                # Cotton necesita más histórico para rellenar huecos
                 p = "20d" if name == "Cotton" else "14d"
                 df = yf.download(tid, period=p, interval="1h", progress=False)
                 df = clean_df(df).dropna()
@@ -63,18 +60,15 @@ def background_worker():
                 lp = float(df['Close'].iloc[-1])
                 
                 if supabase:
-                    # 1. Histórico (Filas 20.440+)
+                    # 1. Histórico (Contador 20.440+)
                     ma20 = df['Close'].tail(20).mean()
                     supabase.table("precios_historicos").insert({"activo": name, "precio": round(lp, 2), "tendencia": "BULLISH" if lp > ma20 else "BEARISH"}).execute()
 
-                    # 2. IA y Logs con SEGURIDAD EXTRA
+                    # 2. IA y Logs
                     ai = get_ai_prediction_v5(name, df['Close'].tolist())
-                    
-                    # RANGOS REALES SIEMPRE SE GUARDAN
                     r_max = round(float(df['High'].tail(24).max()), 2)
                     r_min = round(float(df['Low'].tail(24).min()), 2)
                     
-                    # Si la IA responde correctamente, usamos sus datos. Si no, N/A.
                     ai_trend = ai.get('prediction', 'N/A') if ai else "N/A"
                     ai_conf = ai.get('confidence', '0%') if ai else "0%"
                     ai_max = round(float(ai.get('expected_max', 0)), 2) if ai else 0
@@ -85,21 +79,17 @@ def background_worker():
                         "target_max": ai_max, "target_min": ai_min, "real_max_24h": r_max, "real_min_24h": r_min
                     }).execute()
 
-                    # Solo logueamos si hay predicción real
                     if ai:
                         supabase.table("ai_prediction_logs").insert({
                             "asset": name, "trend": ai_trend, "target_max": ai_max, "target_min": ai_min
                         }).execute()
-                
-                print(f"✅ {name}: Procesado.", flush=True)
                 time.sleep(1.5)
-            except Exception as e:
-                print(f"❌ Error {name}: {str(e)}", flush=True)
+            except Exception as e: print(f"❌ Error {name}: {e}")
         time.sleep(900)
 
 threading.Thread(target=background_worker, daemon=True).start()
 
-# --- DASHBOARD V5.4 (UI V4.6 STYLE) ---
+# --- DASHBOARD V5.5 ---
 @app.get("/visual-dashboard", response_class=HTMLResponse)
 def get_dashboard():
     try:
@@ -108,11 +98,10 @@ def get_dashboard():
         
         ai_current = {item['asset']: item for item in supabase.table("ai_predictions_v5").select("*").execute().data}
         
-        # Validación: 18-30 horas atrás
+        # Validación: Buscamos qué dijimos ayer (hace ~24h)
         t_limit = (datetime.datetime.now() - datetime.timedelta(hours=18)).isoformat()
         t_start = (datetime.datetime.now() - datetime.timedelta(hours=30)).isoformat()
         logs_res = supabase.table("ai_prediction_logs").select("*").lt("created_at", t_limit).gt("created_at", t_start).order("created_at").execute()
-        
         ai_past = {}
         for log in logs_res.data:
             if log['asset'] not in ai_past: ai_past[log['asset']] = log
@@ -135,19 +124,24 @@ def get_dashboard():
                     
                     curr, past = ai_current.get(name, {}), ai_past.get(name, {})
                     
-                    # Validación
-                    val_text = "Wait 24h..."
+                    # Rango Real de Hoy
+                    real_h, real_l = curr.get('real_max_24h', 0), curr.get('real_min_24h', 0)
+                    
+                    # Validación Detallada
+                    val_status = "Wait 24h..."
+                    past_range = "-"
+                    real_comparison = f"Real: [{real_l} - {real_h}]"
+                    
                     if past:
-                        hit = (curr.get('real_max_24h', 0) <= past['target_max'] * 1.005) and (curr.get('real_min_24h', 0) >= past['target_min'] * 0.995)
-                        val_text = "✅ SUCCESS" if hit else "❌ MISSED"
+                        past_range = f"{past['trend']}: [{past['target_min']} - {past['target_max']}]"
+                        hit = (real_h <= past['target_max'] * 1.005) and (real_l >= past['target_min'] * 0.995)
+                        val_status = "✅ SUCCESS" if hit else "❌ MISSED"
 
                     market_data.append({
                         "Asset": name, "Sector": sector, "Price": round(float(hist['Close'].iloc[-1]), 2), "Perf": perf,
-                        "R_H": curr.get('real_max_24h', 0), "R_L": curr.get('real_min_24h', 0),
                         "Trend": curr.get('trend', 'N/A'), "Conf": curr.get('confidence', '0%'),
                         "T_Max": curr.get('target_max', 0), "T_Min": curr.get('target_min', 0),
-                        "Past_Call": f"{past.get('trend', '-')}: [{past.get('target_min', 0)}-{past.get('target_max', 0)}]" if past else "Collecting...",
-                        "Val": val_text
+                        "Past_Call": past_range, "Today_Real": real_comparison, "Val": val_status
                     })
                     trace_idx += 2
                 except: continue
@@ -168,7 +162,7 @@ def get_dashboard():
             color = "#ef4444" if pos > 80 else "#10b981" if pos < 20 else "#3b82f6"
             return f'<div style="width:100%; background:#1e293b; height:6px; border-radius:3px; margin-top:8px; position:relative;"><div style="position:absolute; left:{pos}%; width:10px; height:10px; background:{color}; border-radius:50%; top:-2px; box-shadow:0 0 5px {color};"></div></div>'
 
-        css = "<style>body{background:#0a0a0a;color:white;font-family:sans-serif;}table{width:100%;border-collapse:collapse;table-layout:fixed;}th{padding:15px;text-align:left;background:#111827;color:#94a3b8;font-size:0.75em;}tr{border-bottom:1px solid #1f2937;}td{padding:12px;}.up{color:#10b981;font-weight:bold;}.down{color:#ef4444;font-weight:bold;}.val-box{border-left:1px solid #334155; padding-left:10px;}</style>"
+        css = "<style>body{background:#0a0a0a;color:white;font-family:sans-serif;}table{width:100%;border-collapse:collapse;table-layout:fixed;}th{padding:15px;text-align:left;background:#111827;color:#94a3b8;font-size:0.75em;}tr{border-bottom:1px solid #1f2937;}td{padding:12px;}.up{color:#10b981;font-weight:bold;}.down{color:#ef4444;font-weight:bold;}.val-col{border-left:1px solid #334155; padding-left:15px; background:#0d1117;}</style>"
         
         rows = ""
         for r in sorted(market_data, key=lambda x: x['Perf'], reverse=True):
@@ -179,10 +173,13 @@ def get_dashboard():
                 <td><b>{r['Asset']}</b><br><small style='color:#4b5563'>{r['Sector']}</small></td>
                 <td>${r['Price']}</td>
                 <td class='{pc}'>{r['Perf']}%</td>
-                <td style='color:#64748b'><small>Real High/Low:</small><br>{r['R_H']} / {r['R_L']}</td>
                 <td><span class='{tc}'>{r['Trend']} ({r['Conf']})</span><br><small>Target: {r['T_Min']} - {r['T_Max']}</small>{render_bar(r['Price'], r['T_Min'], r['T_Max'])}</td>
-                <td class="val-box"><small style='color:#94a3b8'>Yesterday's Call:</small><br><small>{r['Past_Call']}</small><br><b class='{vc}'>{r['Val']}</b></td>
+                <td class="val-col">
+                    <small style='color:#94a3b8'>Yesterday's Prediction:</small><br><small>{r['Past_Call']}</small><br>
+                    <small style='color:#94a3b8'>Today's Real Range:</small><br><small>{r['Today_Real']}</small><br>
+                    <b class='{vc}'>{r['Val']}</b>
+                </td>
             </tr>
             """
-        return HTMLResponse(content=f"<html><head>{css}</head><body>{fig.to_html(full_html=False, include_plotlyjs='cdn')}<div style='padding:40px;'><h2 style='text-align:center;color:#64748b;letter-spacing:2px;'>V5.4 QUANT TERMINAL</h2><table><thead><tr><th>ASSET</th><th>PRICE</th><th>7D ROLL</th><th>REAL 24H (TODAY)</th><th>AI TARGET (TOMORROW)</th><th>AI VALIDATION (YESTERDAY)</th></tr></thead><tbody>{rows}</tbody></table></div></body></html>")
+        return HTMLResponse(content=f"<html><head>{css}</head><body>{fig.to_html(full_html=False, include_plotlyjs='cdn')}<div style='padding:40px;'><h2 style='text-align:center;color:#64748b;letter-spacing:2px;'>V5.5 AUDIT TERMINAL</h2><table><thead><tr><th>ASSET</th><th>PRICE</th><th>7D ROLL</th><th>AI TARGET (TOMORROW)</th><th>AI AUDIT (YESTERDAY VS TODAY)</th></tr></thead><tbody>{rows}</tbody></table></div></body></html>")
     except Exception as e: return HTMLResponse(content=f"Error: {e}")
