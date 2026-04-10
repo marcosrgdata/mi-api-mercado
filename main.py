@@ -32,30 +32,23 @@ ALL_TICKERS = {k: v for cat in CATEGORIZED_TICKERS.values() for k, v in cat.item
 
 def clean_df(df, ticker=None):
     if df.empty: return df
-    # Si viene de una descarga masiva, seleccionamos solo el ticker
     if isinstance(df.columns, pd.MultiIndex):
-        if ticker and ticker in df.columns.levels[0]:
-            df = df[ticker]
-        else:
-            df.columns = df.columns.get_level_values(0)
-    # Limpiar duplicados
+        df = df[ticker] if ticker and ticker in df.columns.levels[0] else df.columns.get_level_values(0)
     df = df.loc[:, ~df.columns.duplicated()]
     return df
 
 def get_ai_prediction_v5(asset_name, prices_list):
     try:
         client = Client("marcosrgdata/trading-brain-v5")
+        # Mandamos los últimos 48 datos (2 días de trading)
         p_str = ",".join(map(str, prices_list[-48:]))
-        result = client.predict(asset_name=asset_name, prices_string=p_str, api_name="/predict_v5")
-        if result and isinstance(result, dict) and 'expected_max' in result:
-            return result
-        return None
+        return client.predict(asset_name=asset_name, prices_string=p_str, api_name="/predict_v5")
     except: return None
 
-# --- WORKER (HISTÓRICOS + IA + LOGS) ---
+# --- WORKER V5.7 (MÁS INTELIGENTE) ---
 def background_worker():
     while True:
-        print(f"🤖 Ciclo iniciado: {datetime.datetime.now()}", flush=True)
+        print(f"🤖 Optimizando predicciones: {datetime.datetime.now()}", flush=True)
         for name, tid in ALL_TICKERS.items():
             try:
                 p = "20d" if name == "Cotton" else "14d"
@@ -65,21 +58,28 @@ def background_worker():
                 lp = float(df['Close'].iloc[-1])
                 
                 if supabase:
-                    # 1. Histórico (Contador 20.440+)
+                    # 1. Histórico 20.440+
                     ma20 = df['Close'].tail(20).mean()
                     supabase.table("precios_historicos").insert({"activo": name, "precio": round(lp, 2), "tendencia": "BULLISH" if lp > ma20 else "BEARISH"}).execute()
 
-                    # 2. IA y Logs
+                    # 2. IA con Ajuste de Volatilidad
                     ai = get_ai_prediction_v5(name, df['Close'].tolist())
                     r_max = round(float(df['High'].tail(24).max()), 2)
                     r_min = round(float(df['Low'].tail(24).min()), 2)
                     
                     if ai:
-                        t_max, t_min = round(float(ai['expected_max']), 2), round(float(ai['expected_min']), 2)
+                        # Calculamos volatilidad real (Desviación estándar de los últimos 7 días)
+                        volat = df['Close'].tail(168).std() * 0.5 
+                        
+                        # Ajustamos los targets de la IA para que no sean tan estrechos
+                        t_max = round(float(ai['expected_max']) + (volat * 0.1), 2)
+                        t_min = round(float(ai['expected_min']) - (volat * 0.1), 2)
+                        
                         supabase.table("ai_predictions_v5").upsert({
                             "asset": name, "trend": ai['prediction'], "confidence": ai['confidence'],
                             "target_max": t_max, "target_min": t_min, "real_max_24h": r_max, "real_min_24h": r_min
                         }).execute()
+                        
                         supabase.table("ai_prediction_logs").insert({"asset": name, "trend": ai['prediction'], "target_max": t_max, "target_min": t_min}).execute()
                 time.sleep(1.5)
             except: continue
@@ -87,14 +87,13 @@ def background_worker():
 
 threading.Thread(target=background_worker, daemon=True).start()
 
-# --- DASHBOARD V5.6 ---
+# --- DASHBOARD V5.7 ---
 @app.get("/visual-dashboard", response_class=HTMLResponse)
 def get_dashboard():
     try:
         ticker_ids = list(ALL_TICKERS.values())
         raw_data = yf.download(ticker_ids, period="14d", interval="1h", group_by='ticker', threads=False)
         
-        # Datos de Supabase
         ai_current = {item['asset']: item for item in supabase.table("ai_predictions_v5").select("*").execute().data}
         t_limit = (datetime.datetime.now() - datetime.timedelta(hours=18)).isoformat()
         t_start = (datetime.datetime.now() - datetime.timedelta(hours=30)).isoformat()
@@ -111,10 +110,8 @@ def get_dashboard():
         for sector, assets in CATEGORIZED_TICKERS.items():
             for name, tid in assets.items():
                 try:
-                    # FILTRO CRÍTICO: Aseguramos que hist pertenece solo a este activo
                     hist = clean_df(raw_data[tid], ticker=tid).dropna()
                     if len(hist) < 24: continue
-                    
                     t7d = hist.index[-1] - pd.Timedelta(days=7); idx7 = hist.index.get_indexer([t7d], method='nearest')[0]
                     perf = round(((hist['Close'].iloc[-1] / hist['Close'].iloc[idx7]) - 1) * 100, 2)
                     
@@ -122,15 +119,11 @@ def get_dashboard():
                                                  name=name, legendgroup=name, increasing_line_color=colors[sector], decreasing_line_color='#ffffff'), row=1, col=1)
                     
                     curr, past = ai_current.get(name, {}), ai_past.get(name, {})
+                    real_h, real_l = round(float(hist['High'].tail(24).max()), 2), round(float(hist['Low'].tail(24).min()), 2)
                     
-                    # Rango real directo del hist (para evitar desajustes de Supabase)
-                    real_h = round(float(hist['High'].tail(24).max()), 2)
-                    real_l = round(float(hist['Low'].tail(24).min()), 2)
-                    
-                    # Auditoría de ayer
                     val_text = "Wait 24h..."
                     if past:
-                        hit = (real_h <= past['target_max'] * 1.005) and (real_l >= past['target_min'] * 0.995)
+                        hit = (real_h <= past['target_max'] * 1.002) and (real_l >= past['target_min'] * 0.998)
                         val_text = "✅ SUCCESS" if hit else "❌ MISSED"
 
                     market_data.append({
@@ -144,7 +137,12 @@ def get_dashboard():
                     trace_idx += 2
                 except: continue
 
-        # --- UI & TABLE ---
+        def render_bar(curr, t_min, t_max):
+            if not t_max or t_max == t_min: return ""
+            pos = max(0, min(100, ((curr - t_min) / (t_max - t_min)) * 100))
+            color = "#ef4444" if pos > 80 else "#10b981" if pos < 20 else "#3b82f6"
+            return f'<div style="width:100%; background:#1e293b; height:6px; border-radius:3px; margin-top:8px; position:relative;"><div style="position:absolute; left:{pos}%; width:10px; height:10px; background:{color}; border-radius:50%; top:-2px; box-shadow:0 0 5px {color};"></div></div>'
+
         btns = [dict(method="restyle", label="GLOBAL VIEW", args=[{"visible": [True] * trace_idx}])]
         for s_name in CATEGORIZED_TICKERS.keys():
             vis = []
@@ -154,12 +152,6 @@ def get_dashboard():
 
         fig.update_layout(template="plotly_dark", height=800, margin=dict(t=150, b=50), paper_bgcolor="#0a0a0a", plot_bgcolor="#0a0a0a",
                           xaxis_rangeslider_visible=False, updatemenus=[dict(type="buttons", direction="right", x=0.5, y=1.18, xanchor="center", buttons=btns, bgcolor="#1e293b")])
-
-        def render_bar(curr, t_min, t_max):
-            if not t_max or t_max == t_min: return ""
-            pos = max(0, min(100, ((curr - t_min) / (t_max - t_min)) * 100))
-            color = "#ef4444" if pos > 80 else "#10b981" if pos < 20 else "#3b82f6"
-            return f'<div style="width:100%; background:#1e293b; height:6px; border-radius:3px; margin-top:8px; position:relative;"><div style="position:absolute; left:{pos}%; width:10px; height:10px; background:{color}; border-radius:50%; top:-2px; box-shadow:0 0 5px {color};"></div></div>'
 
         css = "<style>body{background:#0a0a0a;color:white;font-family:sans-serif;}table{width:100%;border-collapse:collapse;table-layout:fixed;}th{padding:15px;text-align:left;background:#111827;color:#94a3b8;font-size:0.75em;}tr{border-bottom:1px solid #1f2937;}td{padding:12px;}.up{color:#10b981;font-weight:bold;}.down{color:#ef4444;font-weight:bold;}.val-col{border-left:1px solid #334155; padding-left:15px; background:#0d1117;}</style>"
         
@@ -180,5 +172,5 @@ def get_dashboard():
                 </td>
             </tr>
             """
-        return HTMLResponse(content=f"<html><head>{css}</head><body>{fig.to_html(full_html=False, include_plotlyjs='cdn')}<div style='padding:40px;'><h2 style='text-align:center;color:#64748b;letter-spacing:2px;'>V5.6 AUDIT TERMINAL</h2><table><thead><tr><th>ASSET</th><th>PRICE</th><th>7D ROLL</th><th>AI TARGET (TOMORROW)</th><th>AI AUDIT (YESTERDAY VS TODAY)</th></tr></thead><tbody>{rows}</tbody></table></div></body></html>")
+        return HTMLResponse(content=f"<html><head>{css}</head><body>{fig.to_html(full_html=False, include_plotlyjs='cdn')}<div style='padding:40px;'><h2 style='text-align:center;color:#64748b;letter-spacing:2px;'>V5.7 AUDIT TERMINAL</h2><table><thead><tr><th>ASSET</th><th>PRICE</th><th>7D ROLL</th><th>AI TARGET (TOMORROW)</th><th>AI AUDIT (YESTERDAY VS TODAY)</th></tr></thead><tbody>{rows}</tbody></table></div></body></html>")
     except Exception as e: return HTMLResponse(content=f"Error: {e}")
