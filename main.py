@@ -30,11 +30,16 @@ CATEGORIZED_TICKERS = {
 }
 ALL_TICKERS = {k: v for cat in CATEGORIZED_TICKERS.values() for k, v in cat.items()}
 
-# --- UTILS ---
-def clean_df(df):
+def clean_df(df, ticker=None):
     if df.empty: return df
-    if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
-    if isinstance(df['Close'], pd.DataFrame): df = df.loc[:, ~df.columns.duplicated()]
+    # Si viene de una descarga masiva, seleccionamos solo el ticker
+    if isinstance(df.columns, pd.MultiIndex):
+        if ticker and ticker in df.columns.levels[0]:
+            df = df[ticker]
+        else:
+            df.columns = df.columns.get_level_values(0)
+    # Limpiar duplicados
+    df = df.loc[:, ~df.columns.duplicated()]
     return df
 
 def get_ai_prediction_v5(asset_name, prices_list):
@@ -47,7 +52,7 @@ def get_ai_prediction_v5(asset_name, prices_list):
         return None
     except: return None
 
-# --- WORKER V5.5 ---
+# --- WORKER (HISTÓRICOS + IA + LOGS) ---
 def background_worker():
     while True:
         print(f"🤖 Ciclo iniciado: {datetime.datetime.now()}", flush=True)
@@ -69,36 +74,28 @@ def background_worker():
                     r_max = round(float(df['High'].tail(24).max()), 2)
                     r_min = round(float(df['Low'].tail(24).min()), 2)
                     
-                    ai_trend = ai.get('prediction', 'N/A') if ai else "N/A"
-                    ai_conf = ai.get('confidence', '0%') if ai else "0%"
-                    ai_max = round(float(ai.get('expected_max', 0)), 2) if ai else 0
-                    ai_min = round(float(ai.get('expected_min', 0)), 2) if ai else 0
-                    
-                    supabase.table("ai_predictions_v5").upsert({
-                        "asset": name, "trend": ai_trend, "confidence": ai_conf,
-                        "target_max": ai_max, "target_min": ai_min, "real_max_24h": r_max, "real_min_24h": r_min
-                    }).execute()
-
                     if ai:
-                        supabase.table("ai_prediction_logs").insert({
-                            "asset": name, "trend": ai_trend, "target_max": ai_max, "target_min": ai_min
+                        t_max, t_min = round(float(ai['expected_max']), 2), round(float(ai['expected_min']), 2)
+                        supabase.table("ai_predictions_v5").upsert({
+                            "asset": name, "trend": ai['prediction'], "confidence": ai['confidence'],
+                            "target_max": t_max, "target_min": t_min, "real_max_24h": r_max, "real_min_24h": r_min
                         }).execute()
+                        supabase.table("ai_prediction_logs").insert({"asset": name, "trend": ai['prediction'], "target_max": t_max, "target_min": t_min}).execute()
                 time.sleep(1.5)
-            except Exception as e: print(f"❌ Error {name}: {e}")
+            except: continue
         time.sleep(900)
 
 threading.Thread(target=background_worker, daemon=True).start()
 
-# --- DASHBOARD V5.5 ---
+# --- DASHBOARD V5.6 ---
 @app.get("/visual-dashboard", response_class=HTMLResponse)
 def get_dashboard():
     try:
         ticker_ids = list(ALL_TICKERS.values())
         raw_data = yf.download(ticker_ids, period="14d", interval="1h", group_by='ticker', threads=False)
         
+        # Datos de Supabase
         ai_current = {item['asset']: item for item in supabase.table("ai_predictions_v5").select("*").execute().data}
-        
-        # Validación: Buscamos qué dijimos ayer (hace ~24h)
         t_limit = (datetime.datetime.now() - datetime.timedelta(hours=18)).isoformat()
         t_start = (datetime.datetime.now() - datetime.timedelta(hours=30)).isoformat()
         logs_res = supabase.table("ai_prediction_logs").select("*").lt("created_at", t_limit).gt("created_at", t_start).order("created_at").execute()
@@ -114,8 +111,10 @@ def get_dashboard():
         for sector, assets in CATEGORIZED_TICKERS.items():
             for name, tid in assets.items():
                 try:
-                    hist = clean_df(raw_data[tid]).dropna()
+                    # FILTRO CRÍTICO: Aseguramos que hist pertenece solo a este activo
+                    hist = clean_df(raw_data[tid], ticker=tid).dropna()
                     if len(hist) < 24: continue
+                    
                     t7d = hist.index[-1] - pd.Timedelta(days=7); idx7 = hist.index.get_indexer([t7d], method='nearest')[0]
                     perf = round(((hist['Close'].iloc[-1] / hist['Close'].iloc[idx7]) - 1) * 100, 2)
                     
@@ -124,28 +123,28 @@ def get_dashboard():
                     
                     curr, past = ai_current.get(name, {}), ai_past.get(name, {})
                     
-                    # Rango Real de Hoy
-                    real_h, real_l = curr.get('real_max_24h', 0), curr.get('real_min_24h', 0)
+                    # Rango real directo del hist (para evitar desajustes de Supabase)
+                    real_h = round(float(hist['High'].tail(24).max()), 2)
+                    real_l = round(float(hist['Low'].tail(24).min()), 2)
                     
-                    # Validación Detallada
-                    val_status = "Wait 24h..."
-                    past_range = "-"
-                    real_comparison = f"Real: [{real_l} - {real_h}]"
-                    
+                    # Auditoría de ayer
+                    val_text = "Wait 24h..."
                     if past:
-                        past_range = f"{past['trend']}: [{past['target_min']} - {past['target_max']}]"
                         hit = (real_h <= past['target_max'] * 1.005) and (real_l >= past['target_min'] * 0.995)
-                        val_status = "✅ SUCCESS" if hit else "❌ MISSED"
+                        val_text = "✅ SUCCESS" if hit else "❌ MISSED"
 
                     market_data.append({
                         "Asset": name, "Sector": sector, "Price": round(float(hist['Close'].iloc[-1]), 2), "Perf": perf,
+                        "R_H": real_h, "R_L": real_l,
                         "Trend": curr.get('trend', 'N/A'), "Conf": curr.get('confidence', '0%'),
                         "T_Max": curr.get('target_max', 0), "T_Min": curr.get('target_min', 0),
-                        "Past_Call": past_range, "Today_Real": real_comparison, "Val": val_status
+                        "Past_Call": f"{past.get('trend', '-')}: [{past.get('target_min', 0)} - {past.get('target_max', 0)}]" if past else "N/A",
+                        "Val": val_text
                     })
                     trace_idx += 2
                 except: continue
 
+        # --- UI & TABLE ---
         btns = [dict(method="restyle", label="GLOBAL VIEW", args=[{"visible": [True] * trace_idx}])]
         for s_name in CATEGORIZED_TICKERS.keys():
             vis = []
@@ -175,11 +174,11 @@ def get_dashboard():
                 <td class='{pc}'>{r['Perf']}%</td>
                 <td><span class='{tc}'>{r['Trend']} ({r['Conf']})</span><br><small>Target: {r['T_Min']} - {r['T_Max']}</small>{render_bar(r['Price'], r['T_Min'], r['T_Max'])}</td>
                 <td class="val-col">
-                    <small style='color:#94a3b8'>Yesterday's Prediction:</small><br><small>{r['Past_Call']}</small><br>
-                    <small style='color:#94a3b8'>Today's Real Range:</small><br><small>{r['Today_Real']}</small><br>
+                    <small style='color:#94a3b8'>Yesterday Prediction:</small><br><small>{r['Past_Call']}</small><br>
+                    <small style='color:#94a3b8'>Today Real Range:</small><br><small>[{r['R_L']} - {r['R_H']}]</small><br>
                     <b class='{vc}'>{r['Val']}</b>
                 </td>
             </tr>
             """
-        return HTMLResponse(content=f"<html><head>{css}</head><body>{fig.to_html(full_html=False, include_plotlyjs='cdn')}<div style='padding:40px;'><h2 style='text-align:center;color:#64748b;letter-spacing:2px;'>V5.5 AUDIT TERMINAL</h2><table><thead><tr><th>ASSET</th><th>PRICE</th><th>7D ROLL</th><th>AI TARGET (TOMORROW)</th><th>AI AUDIT (YESTERDAY VS TODAY)</th></tr></thead><tbody>{rows}</tbody></table></div></body></html>")
+        return HTMLResponse(content=f"<html><head>{css}</head><body>{fig.to_html(full_html=False, include_plotlyjs='cdn')}<div style='padding:40px;'><h2 style='text-align:center;color:#64748b;letter-spacing:2px;'>V5.6 AUDIT TERMINAL</h2><table><thead><tr><th>ASSET</th><th>PRICE</th><th>7D ROLL</th><th>AI TARGET (TOMORROW)</th><th>AI AUDIT (YESTERDAY VS TODAY)</th></tr></thead><tbody>{rows}</tbody></table></div></body></html>")
     except Exception as e: return HTMLResponse(content=f"Error: {e}")
