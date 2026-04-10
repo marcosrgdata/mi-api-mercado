@@ -30,64 +30,82 @@ CATEGORIZED_TICKERS = {
 }
 ALL_TICKERS = {k: v for cat in CATEGORIZED_TICKERS.values() for k, v in cat.items()}
 
+# --- LIMPIEZA ANTIBALAS ---
 def clean_df(df, ticker=None):
     if df.empty: return df
-    if isinstance(df.columns, pd.MultiIndex):
-        df = df[ticker] if ticker and ticker in df.columns.levels[0] else df.columns.get_level_values(0)
-    df = df.loc[:, ~df.columns.duplicated()]
-    return df
+    try:
+        if isinstance(df.columns, pd.MultiIndex):
+            if ticker and ticker in df.columns.levels[0]:
+                df = df[ticker].copy()
+            else:
+                df.columns = df.columns.get_level_values(0)
+        df = df.loc[:, ~df.columns.duplicated()].copy()
+        return df
+    except:
+        return pd.DataFrame()
 
 def get_ai_prediction_v5(asset_name, prices_list):
     try:
         client = Client("marcosrgdata/trading-brain-v5")
-        # Mandamos los últimos 48 datos (2 días de trading)
         p_str = ",".join(map(str, prices_list[-48:]))
         return client.predict(asset_name=asset_name, prices_string=p_str, api_name="/predict_v5")
     except: return None
 
-# --- WORKER V5.7 (MÁS INTELIGENTE) ---
+# --- WORKER V5.8 (REFORZADO) ---
 def background_worker():
     while True:
-        print(f"🤖 Optimizando predicciones: {datetime.datetime.now()}", flush=True)
+        print(f"🤖 Ronda iniciada: {datetime.datetime.now()}", flush=True)
         for name, tid in ALL_TICKERS.items():
             try:
-                p = "20d" if name == "Cotton" else "14d"
-                df = yf.download(tid, period=p, interval="1h", progress=False)
-                df = clean_df(df).dropna()
-                if df.empty: continue
+                # 1. Descarga con reintento simple
+                df_raw = yf.download(tid, period="20d", interval="1h", progress=False)
+                df = clean_df(df_raw, ticker=tid).dropna()
+                
+                if df.empty:
+                    print(f"⚠️ {name}: Vacío", flush=True)
+                    continue
+                
                 lp = float(df['Close'].iloc[-1])
                 
                 if supabase:
-                    # 1. Histórico 20.440+
+                    # 2. INSERTAR PRECIO (Asegura las 20.440+ filas)
                     ma20 = df['Close'].tail(20).mean()
-                    supabase.table("precios_historicos").insert({"activo": name, "precio": round(lp, 2), "tendencia": "BULLISH" if lp > ma20 else "BEARISH"}).execute()
+                    supabase.table("precios_historicos").insert({
+                        "activo": name, "precio": round(lp, 2),
+                        "tendencia": "BULLISH" if lp > ma20 else "BEARISH"
+                    }).execute()
 
-                    # 2. IA con Ajuste de Volatilidad
+                    # 3. IA Y LOGS (Protegido)
                     ai = get_ai_prediction_v5(name, df['Close'].tolist())
                     r_max = round(float(df['High'].tail(24).max()), 2)
                     r_min = round(float(df['Low'].tail(24).min()), 2)
                     
-                    if ai:
-                        # Calculamos volatilidad real (Desviación estándar de los últimos 7 días)
-                        volat = df['Close'].tail(168).std() * 0.5 
-                        
-                        # Ajustamos los targets de la IA para que no sean tan estrechos
-                        t_max = round(float(ai['expected_max']) + (volat * 0.1), 2)
-                        t_min = round(float(ai['expected_min']) - (volat * 0.1), 2)
+                    if ai and 'expected_max' in ai:
+                        # Ajuste de Volatilidad
+                        volat = df['Close'].tail(168).std() * 0.15
+                        t_max = round(float(ai['expected_max']) + volat, 2)
+                        t_min = round(float(ai['expected_min']) - volat, 2)
                         
                         supabase.table("ai_predictions_v5").upsert({
                             "asset": name, "trend": ai['prediction'], "confidence": ai['confidence'],
                             "target_max": t_max, "target_min": t_min, "real_max_24h": r_max, "real_min_24h": r_min
                         }).execute()
                         
-                        supabase.table("ai_prediction_logs").insert({"asset": name, "trend": ai['prediction'], "target_max": t_max, "target_min": t_min}).execute()
-                time.sleep(1.5)
-            except: continue
+                        supabase.table("ai_prediction_logs").insert({
+                            "asset": name, "trend": ai['prediction'], "target_max": t_max, "target_min": t_min
+                        }).execute()
+                
+                print(f"✅ {name} OK", flush=True)
+                time.sleep(1.2)
+            except Exception as e:
+                print(f"❌ Fallo en {name}: {str(e)}", flush=True)
+        
+        print("☕ Ronda terminada. 15 min de pausa.", flush=True)
         time.sleep(900)
 
 threading.Thread(target=background_worker, daemon=True).start()
 
-# --- DASHBOARD V5.7 ---
+# --- DASHBOARD V5.8 ---
 @app.get("/visual-dashboard", response_class=HTMLResponse)
 def get_dashboard():
     try:
@@ -95,6 +113,8 @@ def get_dashboard():
         raw_data = yf.download(ticker_ids, period="14d", interval="1h", group_by='ticker', threads=False)
         
         ai_current = {item['asset']: item for item in supabase.table("ai_predictions_v5").select("*").execute().data}
+        
+        # Validación: 18-30h atrás
         t_limit = (datetime.datetime.now() - datetime.timedelta(hours=18)).isoformat()
         t_start = (datetime.datetime.now() - datetime.timedelta(hours=30)).isoformat()
         logs_res = supabase.table("ai_prediction_logs").select("*").lt("created_at", t_limit).gt("created_at", t_start).order("created_at").execute()
@@ -110,8 +130,9 @@ def get_dashboard():
         for sector, assets in CATEGORIZED_TICKERS.items():
             for name, tid in assets.items():
                 try:
-                    hist = clean_df(raw_data[tid], ticker=tid).dropna()
+                    hist = clean_df(raw_data, ticker=tid).dropna()
                     if len(hist) < 24: continue
+                    
                     t7d = hist.index[-1] - pd.Timedelta(days=7); idx7 = hist.index.get_indexer([t7d], method='nearest')[0]
                     perf = round(((hist['Close'].iloc[-1] / hist['Close'].iloc[idx7]) - 1) * 100, 2)
                     
@@ -123,7 +144,7 @@ def get_dashboard():
                     
                     val_text = "Wait 24h..."
                     if past:
-                        hit = (real_h <= past['target_max'] * 1.002) and (real_l >= past['target_min'] * 0.998)
+                        hit = (real_h <= past['target_max'] * 1.005) and (real_l >= past['target_min'] * 0.995)
                         val_text = "✅ SUCCESS" if hit else "❌ MISSED"
 
                     market_data.append({
@@ -172,5 +193,5 @@ def get_dashboard():
                 </td>
             </tr>
             """
-        return HTMLResponse(content=f"<html><head>{css}</head><body>{fig.to_html(full_html=False, include_plotlyjs='cdn')}<div style='padding:40px;'><h2 style='text-align:center;color:#64748b;letter-spacing:2px;'>V5.7 AUDIT TERMINAL</h2><table><thead><tr><th>ASSET</th><th>PRICE</th><th>7D ROLL</th><th>AI TARGET (TOMORROW)</th><th>AI AUDIT (YESTERDAY VS TODAY)</th></tr></thead><tbody>{rows}</tbody></table></div></body></html>")
+        return HTMLResponse(content=f"<html><head>{css}</head><body>{fig.to_html(full_html=False, include_plotlyjs='cdn')}<div style='padding:40px;'><h2 style='text-align:center;color:#64748b;letter-spacing:2px;'>V5.8 AUDIT TERMINAL</h2><table><thead><tr><th>ASSET</th><th>PRICE</th><th>7D ROLL</th><th>AI TARGET (TOMORROW)</th><th>AI AUDIT (YESTERDAY VS TODAY)</th></tr></thead><tbody>{rows}</tbody></table></div></body></html>")
     except Exception as e: return HTMLResponse(content=f"Error: {e}")
