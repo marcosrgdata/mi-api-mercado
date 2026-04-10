@@ -30,6 +30,7 @@ CATEGORIZED_TICKERS = {
 }
 ALL_TICKERS = {k: v for cat in CATEGORIZED_TICKERS.values() for k, v in cat.items()}
 
+# --- UTILS ---
 def clean_df(df):
     if df.empty: return df
     if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
@@ -40,15 +41,21 @@ def get_ai_prediction_v5(asset_name, prices_list):
     try:
         client = Client("marcosrgdata/trading-brain-v5")
         p_str = ",".join(map(str, prices_list[-48:]))
-        return client.predict(asset_name=asset_name, prices_string=p_str, api_name="/predict_v5")
-    except: return None
+        result = client.predict(asset_name=asset_name, prices_string=p_str, api_name="/predict_v5")
+        # Validamos que la respuesta tenga las llaves necesarias
+        if result and isinstance(result, dict) and 'expected_max' in result:
+            return result
+        return None
+    except:
+        return None
 
-# --- WORKER V5.3 ---
+# --- WORKER V5.4 (FIX KEYERROR COTTON) ---
 def background_worker():
     while True:
         print(f"🤖 Ciclo iniciado: {datetime.datetime.now()}", flush=True)
         for name, tid in ALL_TICKERS.items():
             try:
+                # Cotton necesita más histórico para rellenar huecos
                 p = "20d" if name == "Cotton" else "14d"
                 df = yf.download(tid, period=p, interval="1h", progress=False)
                 df = clean_df(df).dropna()
@@ -56,29 +63,43 @@ def background_worker():
                 lp = float(df['Close'].iloc[-1])
                 
                 if supabase:
-                    # 1. Histórico (Contador 20.440+)
+                    # 1. Histórico (Filas 20.440+)
                     ma20 = df['Close'].tail(20).mean()
                     supabase.table("precios_historicos").insert({"activo": name, "precio": round(lp, 2), "tendencia": "BULLISH" if lp > ma20 else "BEARISH"}).execute()
 
-                    # 2. IA y Logs
+                    # 2. IA y Logs con SEGURIDAD EXTRA
                     ai = get_ai_prediction_v5(name, df['Close'].tolist())
-                    if ai:
-                        t_max, t_min = round(float(ai['expected_max']), 2), round(float(ai['expected_min']), 2)
-                        r_max, r_min = round(float(df['High'].tail(24).max()), 2), round(float(df['Low'].tail(24).min()), 2)
-                        
-                        supabase.table("ai_predictions_v5").upsert({
-                            "asset": name, "trend": ai['prediction'], "confidence": ai['confidence'],
-                            "target_max": t_max, "target_min": t_min, "real_max_24h": r_max, "real_min_24h": r_min
-                        }).execute()
+                    
+                    # RANGOS REALES SIEMPRE SE GUARDAN
+                    r_max = round(float(df['High'].tail(24).max()), 2)
+                    r_min = round(float(df['Low'].tail(24).min()), 2)
+                    
+                    # Si la IA responde correctamente, usamos sus datos. Si no, N/A.
+                    ai_trend = ai.get('prediction', 'N/A') if ai else "N/A"
+                    ai_conf = ai.get('confidence', '0%') if ai else "0%"
+                    ai_max = round(float(ai.get('expected_max', 0)), 2) if ai else 0
+                    ai_min = round(float(ai.get('expected_min', 0)), 2) if ai else 0
+                    
+                    supabase.table("ai_predictions_v5").upsert({
+                        "asset": name, "trend": ai_trend, "confidence": ai_conf,
+                        "target_max": ai_max, "target_min": ai_min, "real_max_24h": r_max, "real_min_24h": r_min
+                    }).execute()
 
-                        supabase.table("ai_prediction_logs").insert({"asset": name, "trend": ai['prediction'], "target_max": t_max, "target_min": t_min}).execute()
+                    # Solo logueamos si hay predicción real
+                    if ai:
+                        supabase.table("ai_prediction_logs").insert({
+                            "asset": name, "trend": ai_trend, "target_max": ai_max, "target_min": ai_min
+                        }).execute()
+                
+                print(f"✅ {name}: Procesado.", flush=True)
                 time.sleep(1.5)
-            except Exception as e: print(f"❌ Error {name}: {e}")
+            except Exception as e:
+                print(f"❌ Error {name}: {str(e)}", flush=True)
         time.sleep(900)
 
 threading.Thread(target=background_worker, daemon=True).start()
 
-# --- DASHBOARD V5.3 ---
+# --- DASHBOARD V5.4 (UI V4.6 STYLE) ---
 @app.get("/visual-dashboard", response_class=HTMLResponse)
 def get_dashboard():
     try:
@@ -87,7 +108,7 @@ def get_dashboard():
         
         ai_current = {item['asset']: item for item in supabase.table("ai_predictions_v5").select("*").execute().data}
         
-        # FIX LOGICA AYER: Buscamos datos que tengan entre 18 y 30 horas de antigüedad
+        # Validación: 18-30 horas atrás
         t_limit = (datetime.datetime.now() - datetime.timedelta(hours=18)).isoformat()
         t_start = (datetime.datetime.now() - datetime.timedelta(hours=30)).isoformat()
         logs_res = supabase.table("ai_prediction_logs").select("*").lt("created_at", t_limit).gt("created_at", t_start).order("created_at").execute()
@@ -114,16 +135,15 @@ def get_dashboard():
                     
                     curr, past = ai_current.get(name, {}), ai_past.get(name, {})
                     
-                    # Validación: Precio real de hoy vs Predicción de ayer
-                    real_h, real_l = curr.get('real_max_24h', 0), curr.get('real_min_24h', 0)
+                    # Validación
                     val_text = "Wait 24h..."
                     if past:
-                        hit = (real_h <= past['target_max'] * 1.005) and (real_l >= past['target_min'] * 0.995)
+                        hit = (curr.get('real_max_24h', 0) <= past['target_max'] * 1.005) and (curr.get('real_min_24h', 0) >= past['target_min'] * 0.995)
                         val_text = "✅ SUCCESS" if hit else "❌ MISSED"
 
                     market_data.append({
                         "Asset": name, "Sector": sector, "Price": round(float(hist['Close'].iloc[-1]), 2), "Perf": perf,
-                        "R_H": real_h, "R_L": real_l,
+                        "R_H": curr.get('real_max_24h', 0), "R_L": curr.get('real_min_24h', 0),
                         "Trend": curr.get('trend', 'N/A'), "Conf": curr.get('confidence', '0%'),
                         "T_Max": curr.get('target_max', 0), "T_Min": curr.get('target_min', 0),
                         "Past_Call": f"{past.get('trend', '-')}: [{past.get('target_min', 0)}-{past.get('target_max', 0)}]" if past else "Collecting...",
@@ -160,9 +180,9 @@ def get_dashboard():
                 <td>${r['Price']}</td>
                 <td class='{pc}'>{r['Perf']}%</td>
                 <td style='color:#64748b'><small>Real High/Low:</small><br>{r['R_H']} / {r['R_L']}</td>
-                <td><span class='{tc}'>{r['Trend']} ({r['Conf']})</span><br><small>Next 24h: {r['T_Min']} - {r['T_Max']}</small>{render_bar(r['Price'], r['T_Min'], r['T_Max'])}</td>
+                <td><span class='{tc}'>{r['Trend']} ({r['Conf']})</span><br><small>Target: {r['T_Min']} - {r['T_Max']}</small>{render_bar(r['Price'], r['T_Min'], r['T_Max'])}</td>
                 <td class="val-box"><small style='color:#94a3b8'>Yesterday's Call:</small><br><small>{r['Past_Call']}</small><br><b class='{vc}'>{r['Val']}</b></td>
             </tr>
             """
-        return HTMLResponse(content=f"<html><head>{css}</head><body>{fig.to_html(full_html=False, include_plotlyjs='cdn')}<div style='padding:40px;'><h2 style='text-align:center;color:#64748b;letter-spacing:2px;'>V5.3 QUANT TERMINAL</h2><table><thead><tr><th>ASSET</th><th>PRICE</th><th>7D ROLL</th><th>REAL 24H (TODAY)</th><th>AI TARGET (TOMORROW)</th><th>AI VALIDATION (YESTERDAY)</th></tr></thead><tbody>{rows}</tbody></table></div></body></html>")
+        return HTMLResponse(content=f"<html><head>{css}</head><body>{fig.to_html(full_html=False, include_plotlyjs='cdn')}<div style='padding:40px;'><h2 style='text-align:center;color:#64748b;letter-spacing:2px;'>V5.4 QUANT TERMINAL</h2><table><thead><tr><th>ASSET</th><th>PRICE</th><th>7D ROLL</th><th>REAL 24H (TODAY)</th><th>AI TARGET (TOMORROW)</th><th>AI VALIDATION (YESTERDAY)</th></tr></thead><tbody>{rows}</tbody></table></div></body></html>")
     except Exception as e: return HTMLResponse(content=f"Error: {e}")
