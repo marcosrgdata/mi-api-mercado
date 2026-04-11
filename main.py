@@ -19,6 +19,7 @@ URL_SB = os.getenv("URL_SB")
 KEY_SB = os.getenv("KEY_SB")
 try:
     supabase = create_client(URL_SB, KEY_SB)
+    print("✅ Conectado a Supabase", flush=True)
 except:
     supabase = None
 
@@ -30,9 +31,9 @@ CATEGORIZED_TICKERS = {
 }
 ALL_TICKERS = {k: v for cat in CATEGORIZED_TICKERS.values() for k, v in cat.items()}
 
-# --- LIMPIEZA ANTIBALAS ---
+# --- LIMPIEZA SEGURA ---
 def clean_df(df, ticker=None):
-    if df.empty: return df
+    if df is None or df.empty: return pd.DataFrame()
     try:
         if isinstance(df.columns, pd.MultiIndex):
             if ticker and ticker in df.columns.levels[0]:
@@ -51,37 +52,34 @@ def get_ai_prediction_v5(asset_name, prices_list):
         return client.predict(asset_name=asset_name, prices_string=p_str, api_name="/predict_v5")
     except: return None
 
-# --- WORKER V5.8 (REFORZADO) ---
+# --- WORKER LIGERO (Sin saturación de hilos) ---
 def background_worker():
     while True:
         print(f"🤖 Ronda iniciada: {datetime.datetime.now()}", flush=True)
         for name, tid in ALL_TICKERS.items():
             try:
-                # 1. Descarga con reintento simple
-                df_raw = yf.download(tid, period="20d", interval="1h", progress=False)
+                # Descarga individual para no saturar memoria
+                df_raw = yf.download(tid, period="20d", interval="1h", progress=False, threads=False)
                 df = clean_df(df_raw, ticker=tid).dropna()
                 
-                if df.empty:
-                    print(f"⚠️ {name}: Vacío", flush=True)
-                    continue
+                if df.empty: continue
                 
                 lp = float(df['Close'].iloc[-1])
                 
                 if supabase:
-                    # 2. INSERTAR PRECIO (Asegura las 20.440+ filas)
+                    # 1. Histórico
                     ma20 = df['Close'].tail(20).mean()
                     supabase.table("precios_historicos").insert({
                         "activo": name, "precio": round(lp, 2),
                         "tendencia": "BULLISH" if lp > ma20 else "BEARISH"
                     }).execute()
 
-                    # 3. IA Y LOGS (Protegido)
+                    # 2. IA
                     ai = get_ai_prediction_v5(name, df['Close'].tolist())
                     r_max = round(float(df['High'].tail(24).max()), 2)
                     r_min = round(float(df['Low'].tail(24).min()), 2)
                     
                     if ai and 'expected_max' in ai:
-                        # Ajuste de Volatilidad
                         volat = df['Close'].tail(168).std() * 0.15
                         t_max = round(float(ai['expected_max']) + volat, 2)
                         t_min = round(float(ai['expected_min']) - volat, 2)
@@ -95,32 +93,29 @@ def background_worker():
                             "asset": name, "trend": ai['prediction'], "target_max": t_max, "target_min": t_min
                         }).execute()
                 
-                print(f"✅ {name} OK", flush=True)
-                time.sleep(1.2)
-            except Exception as e:
-                print(f"❌ Fallo en {name}: {str(e)}", flush=True)
-        
-        print("☕ Ronda terminada. 15 min de pausa.", flush=True)
+                time.sleep(2) # Pausa entre activos para no saturar
+            except: continue
         time.sleep(900)
 
+# Un solo hilo daemon para todo el ciclo de vida de la app
 threading.Thread(target=background_worker, daemon=True).start()
 
-# --- DASHBOARD V5.8 ---
+# --- DASHBOARD ROBUSTO ---
 @app.get("/visual-dashboard", response_class=HTMLResponse)
 def get_dashboard():
     try:
         ticker_ids = list(ALL_TICKERS.values())
+        # Desactivamos hilos en la descarga para evitar el error "can't start new thread"
         raw_data = yf.download(ticker_ids, period="14d", interval="1h", group_by='ticker', threads=False)
         
+        if raw_data is None or raw_data.empty:
+            return HTMLResponse(content="<h1>Error: Yahoo Finance no responde</h1>", status_code=503)
+
         ai_current = {item['asset']: item for item in supabase.table("ai_predictions_v5").select("*").execute().data}
-        
-        # Validación: 18-30h atrás
         t_limit = (datetime.datetime.now() - datetime.timedelta(hours=18)).isoformat()
         t_start = (datetime.datetime.now() - datetime.timedelta(hours=30)).isoformat()
         logs_res = supabase.table("ai_prediction_logs").select("*").lt("created_at", t_limit).gt("created_at", t_start).order("created_at").execute()
-        ai_past = {}
-        for log in logs_res.data:
-            if log['asset'] not in ai_past: ai_past[log['asset']] = log
+        ai_past = {log['asset']: log for log in logs_res.data}
 
         fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.07, row_heights=[0.7, 0.3])
         market_data = []
@@ -131,7 +126,7 @@ def get_dashboard():
             for name, tid in assets.items():
                 try:
                     hist = clean_df(raw_data, ticker=tid).dropna()
-                    if len(hist) < 24: continue
+                    if hist.empty: continue
                     
                     t7d = hist.index[-1] - pd.Timedelta(days=7); idx7 = hist.index.get_indexer([t7d], method='nearest')[0]
                     perf = round(((hist['Close'].iloc[-1] / hist['Close'].iloc[idx7]) - 1) * 100, 2)
@@ -158,12 +153,7 @@ def get_dashboard():
                     trace_idx += 2
                 except: continue
 
-        def render_bar(curr, t_min, t_max):
-            if not t_max or t_max == t_min: return ""
-            pos = max(0, min(100, ((curr - t_min) / (t_max - t_min)) * 100))
-            color = "#ef4444" if pos > 80 else "#10b981" if pos < 20 else "#3b82f6"
-            return f'<div style="width:100%; background:#1e293b; height:6px; border-radius:3px; margin-top:8px; position:relative;"><div style="position:absolute; left:{pos}%; width:10px; height:10px; background:{color}; border-radius:50%; top:-2px; box-shadow:0 0 5px {color};"></div></div>'
-
+        # --- UI LAYOUT ---
         btns = [dict(method="restyle", label="GLOBAL VIEW", args=[{"visible": [True] * trace_idx}])]
         for s_name in CATEGORIZED_TICKERS.keys():
             vis = []
@@ -180,18 +170,8 @@ def get_dashboard():
         for r in sorted(market_data, key=lambda x: x['Perf'], reverse=True):
             tc, pc = ("up" if r['Trend'] == "UP" else "down"), ("up" if r['Perf'] > 0 else "down")
             vc = "up" if "✅" in r['Val'] else "down" if "❌" in r['Val'] else ""
-            rows += f"""
-            <tr>
-                <td><b>{r['Asset']}</b><br><small style='color:#4b5563'>{r['Sector']}</small></td>
-                <td>${r['Price']}</td>
-                <td class='{pc}'>{r['Perf']}%</td>
-                <td><span class='{tc}'>{r['Trend']} ({r['Conf']})</span><br><small>Target: {r['T_Min']} - {r['T_Max']}</small>{render_bar(r['Price'], r['T_Min'], r['T_Max'])}</td>
-                <td class="val-col">
-                    <small style='color:#94a3b8'>Yesterday Prediction:</small><br><small>{r['Past_Call']}</small><br>
-                    <small style='color:#94a3b8'>Today Real Range:</small><br><small>[{r['R_L']} - {r['R_H']}]</small><br>
-                    <b class='{vc}'>{r['Val']}</b>
-                </td>
-            </tr>
-            """
-        return HTMLResponse(content=f"<html><head>{css}</head><body>{fig.to_html(full_html=False, include_plotlyjs='cdn')}<div style='padding:40px;'><h2 style='text-align:center;color:#64748b;letter-spacing:2px;'>V5.8 AUDIT TERMINAL</h2><table><thead><tr><th>ASSET</th><th>PRICE</th><th>7D ROLL</th><th>AI TARGET (TOMORROW)</th><th>AI AUDIT (YESTERDAY VS TODAY)</th></tr></thead><tbody>{rows}</tbody></table></div></body></html>")
-    except Exception as e: return HTMLResponse(content=f"Error: {e}")
+            rows += f"<tr><td><b>{r['Asset']}</b><br><small style='color:#4b5563'>{r['Sector']}</small></td><td>${r['Price']}</td><td class='{pc}'>{r['Perf']}%</td><td><span class='{tc}'>{r['Trend']} ({r['Conf']})</span><br><small>Target: {r['T_Min']} - {r['T_Max']}</small></td><td class='val-col'><small style='color:#94a3b8'>Yesterday:</small><br><small>{r['Past_Call']}</small><br><b class='{vc}'>{r['Val']}</b></td></tr>"
+            
+        return HTMLResponse(content=f"<html><head>{css}</head><body>{fig.to_html(full_html=False, include_plotlyjs='cdn')}<div style='padding:40px;'><h2 style='text-align:center;color:#64748b;'>V5.9 AUDIT TERMINAL</h2><table><thead><tr><th>ASSET</th><th>PRICE</th><th>7D ROLL</th><th>AI TARGET (TOMORROW)</th><th>AI AUDIT (YESTERDAY VS TODAY)</th></tr></thead><tbody>{rows}</tbody></table></div></body></html>")
+    except Exception as e:
+        return HTMLResponse(content=f"<h1>Error Crítico</h1><code>{str(e)}</code>")
